@@ -442,10 +442,15 @@ private fun DrawScope.drawLineChart(
     if (points.size < 2) return
     val tRange = (tEnd - tStart).coerceAtLeast(1L).toFloat()
     val yRange = (yMax - yMin).coerceAtLeast(1e-9)
+    // Defensive: draw strictly left-to-right and break the path on any non-finite value,
+    // so a stray timestamp or bad sample can never produce a line jumping across the chart.
+    val ordered = if (points.asSequence().zipWithNext().all { (a, b) -> a.first <= b.first })
+        points else points.sortedBy { it.first }
     val path = Path()
     var first = true
-    for ((ts, v) in points) {
-        val x = ((ts - tStart).toFloat() / tRange) * size.width
+    for ((ts, v) in ordered) {
+        if (!v.isFinite()) { first = true; continue }
+        val x = (((ts - tStart).toFloat() / tRange) * size.width).coerceIn(0f, size.width)
         val y = (size.height * (1.0 - (v - yMin) / yRange)).toFloat().coerceIn(0f, size.height)
         if (first) { path.moveTo(x, y); first = false } else path.lineTo(x, y)
     }

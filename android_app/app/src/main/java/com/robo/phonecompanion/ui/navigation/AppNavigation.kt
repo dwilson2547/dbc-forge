@@ -267,7 +267,13 @@ fun AppNavigation(canBusVm: CanBusViewModel, settingsVm: SettingsViewModel) {
                     arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
                 ) { back ->
                     val sessionId = back.arguments?.getString("sessionId") ?: return@composable
-                    LogBrowserScreen(sessionId = sessionId)
+                    LogBrowserScreen(
+                        sessionId = sessionId,
+                        onAddToDbc = { prefill ->
+                            canBusVm.setPendingPrefill(prefill)
+                            navController.navigate("editor/${prefill.rawId}/new")
+                        },
+                    )
                 }
                 composable("settings/dbcs") {
                     DbcListScreen(vm = settingsVm, canBusVm = canBusVm)

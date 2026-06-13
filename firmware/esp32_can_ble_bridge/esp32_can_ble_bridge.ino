@@ -58,7 +58,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.5.0";
+constexpr char kFirmwareVersion[] = "1.5.2";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -75,7 +75,8 @@ constexpr uint32_t   kBaud     = 500000;
 // AD0 strapped high → address 0x4B. Poll mode (no INT dependency in the hot loop).
 constexpr uint8_t  kImuAddr        = 0x4B;
 constexpr uint32_t kImuI2cHz       = 100000;   // BNO08x stretches the clock — keep at 100 kHz
-constexpr uint16_t kImuReportMs    = 20;       // 50 Hz sensor reports
+constexpr uint16_t kImuReportMs    = 20;       // 50 Hz — gyro + linear accel
+constexpr uint16_t kImuRvReportMs  = 100;      // 10 Hz — game rotation vector (see note in enableImuReports)
 constexpr uint32_t kImuEmitMs      = 20;       // throttle combined IMU lines to 50 Hz
 constexpr int      kImuDrainMax    = 8;        // max sensor events serviced per loop pass
 
@@ -439,9 +440,15 @@ void flushBuf() {
 // ── IMU (BNO085) ──────────────────────────────────────────────────────────────
 
 void enableImuReports() {
-    gImu.enableRotationVector(kImuReportMs);       // absolute orientation quaternion
-    gImu.enableLinearAccelerometer(kImuReportMs);  // gravity-removed accel (m/s²)
-    gImu.enableGyro(kImuReportMs);                 // calibrated rate (rad/s); yaw = Z
+    // Game rotation vector (gyro+accel fusion, NO magnetometer): gravity-referenced
+    // orientation — all we need for the yaw projection and vehicle-frame accel rotation.
+    // Run it at 10 Hz, NOT 50 Hz: three fused reports at 50 Hz starve the BNO085's
+    // scheduler and the rotation-vector report dies after one sample (observed: frozen
+    // quaternion while gyro/accel kept streaming; confirmed it streams again at 10 Hz).
+    // Orientation changes slowly, so 10 Hz is plenty; yaw rate still comes from 50 Hz gyro.
+    gImu.enableGameRotationVector(kImuRvReportMs);  // 10 Hz orientation quaternion
+    gImu.enableLinearAccelerometer(kImuReportMs);   // 50 Hz gravity-removed accel (m/s²)
+    gImu.enableGyro(kImuReportMs);                  // 50 Hz calibrated rate (rad/s); yaw = Z
 }
 
 // Attempt I2C begin + report enable. Returns true once the sensor is up. Retried from
@@ -472,9 +479,9 @@ void serviceImu() {
     if (gImu.wasReset()) enableImuReports();
     for (int i = 0; i < kImuDrainMax && gImu.getSensorEvent(); i++) {
         switch (gImu.getSensorEventID()) {
-            case SENSOR_REPORTID_ROTATION_VECTOR:
-                gQw = gImu.getQuatReal(); gQx = gImu.getQuatI();
-                gQy = gImu.getQuatJ();    gQz = gImu.getQuatK();
+            case SENSOR_REPORTID_GAME_ROTATION_VECTOR:
+                gQw = gImu.getGameQuatReal(); gQx = gImu.getGameQuatI();
+                gQy = gImu.getGameQuatJ();    gQz = gImu.getGameQuatK();
                 gImuHasData = true;
                 break;
             case SENSOR_REPORTID_LINEAR_ACCELERATION:

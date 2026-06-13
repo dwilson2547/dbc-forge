@@ -84,6 +84,7 @@ import com.robo.phonecompanion.vm.DisplayFrame
 import com.robo.phonecompanion.vm.LogPlayerViewModel
 import com.robo.phonecompanion.vm.ReferenceChannel
 import com.robo.phonecompanion.vm.ScanHit
+import com.robo.phonecompanion.vm.SignalPrefill
 import com.robo.phonecompanion.vm.SignalDiff
 import com.robo.phonecompanion.vm.SparklineSeries
 
@@ -106,6 +107,7 @@ private val PlotColors = listOf(
 @Composable
 fun LogBrowserScreen(
     sessionId: String,
+    onAddToDbc: (SignalPrefill) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val vm: LogPlayerViewModel = viewModel()
@@ -199,7 +201,11 @@ fun LogBrowserScreen(
 
     discovery?.let { run ->
         if (!discoveryRunning) {
-            DiscoveryDialog(run = run, onDismiss = { vm.clearDiscovery() })
+            DiscoveryDialog(
+                run = run,
+                onDismiss = { vm.clearDiscovery() },
+                onAdd = { hit -> onAddToDbc(prefillFromHit(hit)) },
+            )
         }
     }
 
@@ -946,6 +952,8 @@ private fun formatDur(ms: Long): String {
 private fun channelSignalBase(channel: ReferenceChannel): String = when (channel) {
     ReferenceChannel.GPS_SPEED -> "VEHICLE_SPEED"
     ReferenceChannel.IMU_YAW_RATE -> "YAW_RATE"
+    ReferenceChannel.LONG_ACCEL -> "LONGITUDINAL_ACCEL"
+    ReferenceChannel.LAT_ACCEL -> "LATERAL_ACCEL"
 }
 
 /** A DBC `SG_` line for a discovery hit — copyable to paste under the matching BO_. */
@@ -958,8 +966,32 @@ private fun dbcSgLine(hit: ScanHit): String {
         "(${"%.6g".format(c.factor)},${"%.6g".format(c.offset)}) [0|0] \"${hit.channel.unit}\" Vector__XXX"
 }
 
+/** Build a signal-editor prefill from a discovery hit. */
+private fun prefillFromHit(hit: ScanHit): SignalPrefill {
+    val c = hit.candidate
+    val rawId = if (hit.isExtended) hit.canId or 0x80000000.toInt() else hit.canId
+    val idHex = if (hit.isExtended) "%08X".format(hit.canId) else "%03X".format(hit.canId)
+    return SignalPrefill(
+        rawId = rawId,
+        msgName = hit.knownMessage ?: "MSG_$idHex",
+        name = "${channelSignalBase(hit.channel)}_${c.startBit}",
+        startBit = c.startBit,
+        length = c.length,
+        byteOrder = c.byteOrder,
+        signed = c.signed,
+        factor = c.factor,
+        offset = c.offset,
+        unit = hit.channel.unit,
+        dlc = hit.dlc,
+    )
+}
+
 @Composable
-private fun DiscoveryDialog(run: DiscoveryRun, onDismiss: () -> Unit) {
+private fun DiscoveryDialog(
+    run: DiscoveryRun,
+    onDismiss: () -> Unit,
+    onAdd: (ScanHit) -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -977,8 +1009,8 @@ private fun DiscoveryDialog(run: DiscoveryRun, onDismiss: () -> Unit) {
                     Text(run.note, style = MaterialTheme.typography.bodyMedium)
                 } else {
                     Text(
-                        "${run.hits.size} candidate(s), ranked by correlation. Copy a line into " +
-                            "your DBC (under the matching message) and verify.",
+                        "${run.hits.size} candidate(s), ranked by correlation. \"Add\" opens the " +
+                            "signal editor pre-filled; \"≈\" marks bits already mapped to a signal.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -987,7 +1019,11 @@ private fun DiscoveryDialog(run: DiscoveryRun, onDismiss: () -> Unit) {
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         items(run.hits) { hit ->
-                            HitRow(hit) { clipboard.setText(AnnotatedString(dbcSgLine(hit))) }
+                            HitRow(
+                                hit = hit,
+                                onCopy = { clipboard.setText(AnnotatedString(dbcSgLine(hit))) },
+                                onAdd = { onAdd(hit) },
+                            )
                         }
                     }
                 }
@@ -997,15 +1033,16 @@ private fun DiscoveryDialog(run: DiscoveryRun, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun HitRow(hit: ScanHit, onCopy: () -> Unit) {
+private fun HitRow(hit: ScanHit, onCopy: () -> Unit, onAdd: () -> Unit) {
     val c = hit.candidate
     val idStr = if (hit.isExtended) "0x%08X".format(hit.canId) else "0x%03X".format(hit.canId)
     val endian = if (c.byteOrder == ByteOrder.INTEL) "Intel" else "Motorola"
     val sign = if (c.signed) "signed" else "unsigned"
     val rText = "r=${"%+.2f".format(c.correlation)}" + if (c.correlation < 0) " (inv)" else ""
+    val mapped = hit.overlapsSignal != null
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (mapped) 0.25f else 0.4f),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
@@ -1019,6 +1056,21 @@ private fun HitRow(hit: ScanHit, onCopy: () -> Unit) {
                     fontFamily = FontFamily.Monospace,
                     color = ColorActive,
                 )
+                // Mapping status: already-mapped (which signal) vs new-in-known-message.
+                val tag = when {
+                    hit.overlapsSignal != null -> "≈ ${hit.overlapsSignal} (already mapped)"
+                    hit.knownMessage != null -> "new in ${hit.knownMessage}"
+                    else -> null
+                }
+                tag?.let {
+                    Text(
+                        it,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (mapped) MaterialTheme.colorScheme.error      // red = skip, already mapped
+                            else MaterialTheme.colorScheme.tertiary,             // green = new
+                    )
+                }
                 Text(
                     "bit ${c.startBit} · ${c.length}b · $endian · $sign",
                     fontSize = 12.sp,
@@ -1033,7 +1085,10 @@ private fun HitRow(hit: ScanHit, onCopy: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            TextButton(onClick = onCopy) { Text("Copy SG_") }
+            Column(horizontalAlignment = Alignment.End) {
+                TextButton(onClick = onAdd) { Text("Add") }
+                TextButton(onClick = onCopy) { Text("Copy SG_", fontSize = 11.sp) }
+            }
         }
     }
 }

@@ -199,21 +199,19 @@ fun SettingsScreen(
         )
         HorizontalDivider()
 
-        // Recent commits
-        if (recentCommits.isNotEmpty()) {
+        // Last commit (single line so Pull/Push above stay visible)
+        recentCommits.firstOrNull()?.let { (hash, subject) ->
             Text(
-                "Recent commits",
+                "Last commit",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 4.dp),
             )
-            recentCommits.forEach { (hash, subject) ->
-                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-                    Text(hash, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(end = 8.dp))
-                    Text(subject, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
-                }
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                Text(hash, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(end = 8.dp))
+                Text(subject, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
             }
         }
 

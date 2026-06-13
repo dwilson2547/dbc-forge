@@ -82,17 +82,22 @@ fun SignalEditorScreen(
     val existingMessage = rawId?.let { activeDbc?.messages?.get(it) }
     val existingSignal = existingMessage?.signals?.find { it.name == signalName }
 
+    // Discovery prefill (Phase 11.7): for a new signal, seed the form from a Discover hit.
+    val prefill = remember(rawId) {
+        if (existingSignal == null) canBusVm.takePendingPrefill(rawId) else null
+    }
+
     // ── Form state ────────────────────────────────────────────────────────────
 
-    var msgName by rememberSaveable { mutableStateOf(existingMessage?.name ?: "") }
-    var name by rememberSaveable { mutableStateOf(existingSignal?.name ?: "") }
-    var startBit by rememberSaveable { mutableIntStateOf(existingSignal?.startBit ?: 0) }
-    var length by rememberSaveable { mutableIntStateOf(existingSignal?.length ?: 8) }
-    var byteOrder by remember { mutableStateOf(existingSignal?.byteOrder ?: ByteOrder.INTEL) }
-    var signed by rememberSaveable { mutableStateOf(existingSignal?.signed ?: false) }
-    var factor by rememberSaveable { mutableStateOf(existingSignal?.factor?.toString() ?: "1.0") }
-    var offset by rememberSaveable { mutableStateOf(existingSignal?.offset?.toString() ?: "0.0") }
-    var unit by rememberSaveable { mutableStateOf(existingSignal?.unit ?: "") }
+    var msgName by rememberSaveable { mutableStateOf(existingMessage?.name ?: prefill?.msgName ?: "") }
+    var name by rememberSaveable { mutableStateOf(existingSignal?.name ?: prefill?.name ?: "") }
+    var startBit by rememberSaveable { mutableIntStateOf(existingSignal?.startBit ?: prefill?.startBit ?: 0) }
+    var length by rememberSaveable { mutableIntStateOf(existingSignal?.length ?: prefill?.length ?: 8) }
+    var byteOrder by remember { mutableStateOf(existingSignal?.byteOrder ?: prefill?.byteOrder ?: ByteOrder.INTEL) }
+    var signed by rememberSaveable { mutableStateOf(existingSignal?.signed ?: prefill?.signed ?: false) }
+    var factor by rememberSaveable { mutableStateOf(existingSignal?.factor?.toString() ?: prefill?.factor?.toString() ?: "1.0") }
+    var offset by rememberSaveable { mutableStateOf(existingSignal?.offset?.toString() ?: prefill?.offset?.toString() ?: "0.0") }
+    var unit by rememberSaveable { mutableStateOf(existingSignal?.unit ?: prefill?.unit ?: "") }
     var min by rememberSaveable { mutableStateOf(existingSignal?.min?.toString() ?: "0.0") }
     var max by rememberSaveable { mutableStateOf(existingSignal?.max?.toString() ?: "0.0") }
     var comment by rememberSaveable { mutableStateOf(existingSignal?.comment ?: "") }
@@ -109,6 +114,7 @@ fun SignalEditorScreen(
         mutableStateOf(
             when {
                 existingMessage != null -> existingMessage.dlc.toString()
+                prefill != null -> prefill.dlc.toString()
                 canId != null -> (canBusVm.lastFrameData(canId)?.size ?: 8).toString()
                 else -> "8"
             }

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.robo.phonecompanion.data.decoder.SignalCorrelator
 import com.robo.phonecompanion.data.decoder.SignalDecoder
 import com.robo.phonecompanion.data.model.CanFrame
+import com.robo.phonecompanion.data.model.DbcMessage
 import com.robo.phonecompanion.data.model.GpsSample
 import com.robo.phonecompanion.data.model.ImuSample
 import com.robo.phonecompanion.data.model.SessionMeta
@@ -46,6 +47,9 @@ data class SparklineSeries(
 enum class ReferenceChannel(val label: String, val unit: String, val targetHint: String) {
     GPS_SPEED("GPS speed", "km/h", "VEHICLE_SPEED / WHEEL_SPEED_*"),
     IMU_YAW_RATE("IMU yaw rate", "deg/s", "YAW_RATE / STEERING_ANGLE"),
+    // Derived kinematically (no IMU-accel orientation calibration needed):
+    LONG_ACCEL("Long accel", "m/s²", "LONGITUDINAL_ACCEL / brake / throttle"),
+    LAT_ACCEL("Lateral accel", "m/s²", "LATERAL_ACCEL"),
 }
 
 /** One candidate bit field that correlated with a channel, tagged with its CAN ID. */
@@ -55,6 +59,8 @@ data class ScanHit(
     val channel: ReferenceChannel,
     val candidate: SignalCorrelator.Candidate,
     val knownMessage: String? = null,   // message name if this ID is already in the DBC
+    val overlapsSignal: String? = null, // existing signal this bit window re-detects, if any
+    val dlc: Int = 8,                   // frame length for this ID (for prefilling a new message)
 )
 
 /** Result of a discovery run — either one CAN ID or a full sweep of unknown IDs. */
@@ -361,8 +367,28 @@ class LogPlayerViewModel(application: Application) : AndroidViewModel(applicatio
 
     /** Reference channels that actually have usable (varying) data this session. */
     fun availableChannels(): List<ReferenceChannel> = buildList {
-        if (_gpsSamples.value.any { it.hasSpeed }) add(ReferenceChannel.GPS_SPEED)
-        if (_imuSamples.value.isNotEmpty()) add(ReferenceChannel.IMU_YAW_RATE)
+        val hasGps = _gpsSamples.value.any { it.hasSpeed }
+        val hasImu = _imuSamples.value.isNotEmpty()
+        if (hasGps) add(ReferenceChannel.GPS_SPEED)
+        if (hasImu) add(ReferenceChannel.IMU_YAW_RATE)
+        if (hasGps) add(ReferenceChannel.LONG_ACCEL)         // d(speed)/dt
+        if (hasGps && hasImu) add(ReferenceChannel.LAT_ACCEL) // v · yawRate
+    }
+
+    /** Linear interpolation of GPS speed (m/s) at time [t]; assumes [gps] sorted by time. */
+    private fun interpSpeedMps(gps: List<GpsSample>, t: Long): Double {
+        if (gps.isEmpty()) return 0.0
+        if (t <= gps.first().timestampMs) return gps.first().speedMps.toDouble()
+        if (t >= gps.last().timestampMs) return gps.last().speedMps.toDouble()
+        var lo = 0; var hi = gps.size - 1
+        while (hi - lo > 1) {
+            val mid = (lo + hi) / 2
+            if (gps[mid].timestampMs <= t) lo = mid else hi = mid
+        }
+        val a = gps[lo]; val b = gps[hi]
+        if (b.timestampMs == a.timestampMs) return a.speedMps.toDouble()
+        val frac = (t - a.timestampMs).toDouble() / (b.timestampMs - a.timestampMs)
+        return a.speedMps + frac * (b.speedMps - a.speedMps)
     }
 
     private fun refPointsFor(channel: ReferenceChannel): List<SignalCorrelator.RefPoint> =
@@ -370,6 +396,32 @@ class LogPlayerViewModel(application: Application) : AndroidViewModel(applicatio
             ReferenceChannel.GPS_SPEED -> _gpsSamples.value
                 .filter { it.hasSpeed }
                 .map { SignalCorrelator.RefPoint(it.timestampMs, it.speedKmh.toDouble()) }
+
+            // Longitudinal accel = d(speed)/dt from consecutive GPS fixes (m/s²).
+            ReferenceChannel.LONG_ACCEL -> {
+                val gps = _gpsSamples.value.filter { it.hasSpeed }.sortedBy { it.timestampMs }
+                buildList {
+                    for (i in 1 until gps.size) {
+                        val dt = (gps[i].timestampMs - gps[i - 1].timestampMs) / 1000.0
+                        if (dt > 0.05) {
+                            val a = (gps[i].speedMps - gps[i - 1].speedMps) / dt
+                            val t = (gps[i].timestampMs + gps[i - 1].timestampMs) / 2
+                            add(SignalCorrelator.RefPoint(t, a.toDouble()))
+                        }
+                    }
+                }
+            }
+
+            // Lateral accel = v · yawRate (centripetal), at each 50 Hz IMU sample (m/s²).
+            ReferenceChannel.LAT_ACCEL -> {
+                val gps = _gpsSamples.value.filter { it.hasSpeed }.sortedBy { it.timestampMs }
+                _imuSamples.value.map { imu ->
+                    val v = interpSpeedMps(gps, imu.timestampMs)
+                    val omega = imu.verticalYawRateDegPerSec / 57.29578   // rad/s
+                    SignalCorrelator.RefPoint(imu.timestampMs, v * omega)
+                }
+            }
+
             ReferenceChannel.IMU_YAW_RATE -> _imuSamples.value
                 .map { SignalCorrelator.RefPoint(it.timestampMs, it.verticalYawRateDegPerSec.toDouble()) }
         }
@@ -473,7 +525,17 @@ class LogPlayerViewModel(application: Application) : AndroidViewModel(applicatio
                 cb.count { it in defined } <= cb.size / 2   // keep only mostly-undecoded windows
             }
         }
-        return candidates.map { ScanHit(canId, isExtended, channel, it, knownMessage = message?.name) }
+        return candidates.map { c ->
+            val cb = SignalCorrelator.bitsCovered(c.startBit, c.length, c.byteOrder)
+            // Which existing signal (if any) does this window re-detect? Tag it so the user
+            // can tell new signals from already-mapped ones.
+            val overlap = message?.signals
+                ?.map { it.name to SignalCorrelator.bitsCovered(it.startBit, it.length, it.byteOrder).count { b -> b in cb } }
+                ?.maxByOrNull { it.second }
+            val overlapName = overlap?.takeIf { it.second * 4 >= cb.size }?.first  // ≥25% of candidate bits
+            ScanHit(canId, isExtended, channel, c, knownMessage = message?.name,
+                overlapsSignal = overlapName, dlc = dlc)
+        }
     }
 
     private fun discoveryNote(channels: List<ReferenceChannel>, empty: Boolean): String = when {

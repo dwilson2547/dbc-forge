@@ -107,6 +107,21 @@ data class SignalHealth(
     val isPegged: Boolean = false,
 )
 
+/** Pre-filled signal definition handed from a Discover hit into the signal editor. */
+data class SignalPrefill(
+    val rawId: Int,          // DBC raw id (bit 31 set for extended)
+    val msgName: String,     // suggested message name (used only for a new message)
+    val name: String,
+    val startBit: Int,
+    val length: Int,
+    val byteOrder: com.robo.phonecompanion.data.model.ByteOrder,
+    val signed: Boolean,
+    val factor: Double,
+    val offset: Double,
+    val unit: String,
+    val dlc: Int,
+)
+
 data class OdbCrossRef(
     val signalKey: String,   // "msgName/sigName"
     val pid: Int,
@@ -270,6 +285,17 @@ class CanBusViewModel(application: Application) : AndroidViewModel(application) 
     private val imuChannel = Channel<ImuSample>(Channel.UNLIMITED)
     private val _imuStatus = MutableStateFlow<ImuSample?>(null)
     val imuStatus: StateFlow<ImuSample?> = _imuStatus.asStateFlow()
+
+    // One-shot prefill handed from a discovery hit to the signal editor (Phase 11.7).
+    @Volatile private var pendingPrefill: SignalPrefill? = null
+    fun setPendingPrefill(p: SignalPrefill) { pendingPrefill = p }
+    /** Consume the prefill if it targets [rawId]; returns null otherwise. */
+    fun takePendingPrefill(rawId: Int?): SignalPrefill? {
+        val p = pendingPrefill ?: return null
+        if (rawId != null && p.rawId != rawId) return null
+        pendingPrefill = null
+        return p
+    }
 
     // Per-ID tracking for rate and history
     private val idTimestamps = mutableMapOf<Int, ArrayDeque<Long>>()
@@ -1080,23 +1106,39 @@ class CanBusViewModel(application: Application) : AndroidViewModel(application) 
                                 ?: atomicParseErrors.incrementAndGet()
                         }
                     }
-                    // Intra-packet timestamps reconstructed from firmware capture offsets;
-                    // frames and IMU lines share the same dongle clock, so use one max.
-                    val maxFwTs = (rawFrames.mapNotNull { it.firmwareTimestampMs } +
-                        rawImu.mapNotNull { it.firmwareTimestampMs }).maxOrNull()
-                    rawFrames.forEach { frame ->
-                        val adjusted = if (frame.firmwareTimestampMs != null && maxFwTs != null) {
-                            val delta = ((maxFwTs - frame.firmwareTimestampMs) + 65536L) % 65536L
-                            frame.copy(timestampMs = now - delta, firmwareTimestampMs = null)
-                        } else frame
-                        rawFrameChannel.trySend(adjusted)
-                    }
-                    rawImu.forEach { sample ->
-                        val adjusted = if (sample.firmwareTimestampMs != null && maxFwTs != null) {
-                            val delta = ((maxFwTs - sample.firmwareTimestampMs) + 65536L) % 65536L
-                            sample.copy(timestampMs = now - delta, firmwareTimestampMs = null)
-                        } else sample
-                        imuChannel.trySend(adjusted)
+                    // Reconstruct intra-packet timestamps from the firmware's 16-bit
+                    // (millis % 65536) capture counter. The latest entry maps to `now`,
+                    // earlier ones to `now - age`. The counter WRAPS every 65.536 s, so the
+                    // numerical max is not the temporally-latest entry across a wrap — using
+                    // it shoved post-wrap frames tens of seconds into the past (stray graph
+                    // lines + bad correlation timing). Use signed circular offsets from a
+                    // pivot instead: all entries in a packet are within a few hundred ms, far
+                    // under the ±32768 ms unambiguous range.
+                    val allFwTs = rawFrames.mapNotNull { it.firmwareTimestampMs } +
+                        rawImu.mapNotNull { it.firmwareTimestampMs }
+                    if (allFwTs.isNotEmpty()) {
+                        val pivot = allFwTs.first()
+                        // signed offset of fw from pivot, in [-32768, 32767]
+                        fun signedOff(fw: Long): Long =
+                            (((fw - pivot) % 65536L + 65536L + 32768L) % 65536L) - 32768L
+                        val refOff = allFwTs.maxOf { signedOff(it) }   // latest entry
+                        rawFrames.forEach { frame ->
+                            val adjusted = frame.firmwareTimestampMs?.let { fw ->
+                                val age = (refOff - signedOff(fw)).coerceAtLeast(0L)
+                                frame.copy(timestampMs = now - age, firmwareTimestampMs = null)
+                            } ?: frame
+                            rawFrameChannel.trySend(adjusted)
+                        }
+                        rawImu.forEach { sample ->
+                            val adjusted = sample.firmwareTimestampMs?.let { fw ->
+                                val age = (refOff - signedOff(fw)).coerceAtLeast(0L)
+                                sample.copy(timestampMs = now - age, firmwareTimestampMs = null)
+                            } ?: sample
+                            imuChannel.trySend(adjusted)
+                        }
+                    } else {
+                        rawFrames.forEach { rawFrameChannel.trySend(it) }
+                        rawImu.forEach { imuChannel.trySend(it) }
                     }
                 }
                 OTA_STATUS_UUID -> {

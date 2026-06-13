@@ -12,11 +12,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"     # this project (dbc-forge), rename-proof
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"     # robo-services (shared bin/)
 
 ARDUINO_CLI="$REPO_ROOT/bin/arduino-cli"
-FIRMWARE_SRC="$REPO_ROOT/phone_companion/firmware/esp32_can_ble_bridge"
-ASSETS_DIR="$REPO_ROOT/phone_companion/android_app/app/src/main/assets/firmware"
+FIRMWARE_SRC="$PROJECT_ROOT/firmware/esp32_can_ble_bridge"
+ASSETS_DIR="$PROJECT_ROOT/android_app/app/src/main/assets/firmware"
 BUILD_DIR="/tmp/can_ble_ota_build"
 FQBN="esp32:esp32:XIAO_ESP32C6"
 

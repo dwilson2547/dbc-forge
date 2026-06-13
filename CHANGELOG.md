@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-06-12 (session 32 — lateral/longitudinal accel discovery (11.11))
+
+### Added
+- **Lateral & longitudinal acceleration reference channels** for signal discovery, derived **kinematically with no orientation calibration**: `LONG_ACCEL` = d(GPS speed)/dt; `LAT_ACCEL` = v·yawRate (centripetal, using GPS speed + mount-tolerant IMU yaw rate). New `ReferenceChannel` entries with `refPointsFor` derivations + a GPS-speed interpolator; `availableChannels()` enables them when the needed data is present (long needs GPS; lateral needs GPS + IMU). Discover/Add flows pick them up automatically (target names `LONGITUDINAL_ACCEL` / `LATERAL_ACCEL`).
+
+### Validated (replayed the road session offline)
+- Reference channels are real and varied: lateral −4.1…+8.8 m/s² (std 0.97), longitudinal −3.5…+3.4 m/s² (std 0.90).
+- **Longitudinal** surfaced several plausible powertrain IDs correlating with acceleration (0x191 r=0.70, 0xC9 r=0.69, 0x1C3/0x3D1 r=0.68) — moderate, as expected since d/dt of 1 Hz GPS speed is coarse/noisy. Worth verifying in-app.
+- **Lateral** found nothing ≥0.5 — same story as yaw rate: this 2008 Impala doesn't broadcast lateral dynamics on the OBD-II HS-CAN. The tool correctly reports nothing rather than a false positive.
+- Note: longitudinal fidelity is limited by 1 Hz GPS; smoothing the speed or using the (calibrated) BNO085 linear accel could improve it later.
+
+## 2026-06-12 (session 31 — fix per-frame timestamp wrap (stray graph lines))
+
+### Fixed
+- **Non-monotonic frame timestamps → stray graph lines + degraded correlation timing.** The dongle stamps each frame/IMU line with a 16-bit `millis() % 65536` counter; the phone reconstructed per-entry times by mapping the **numerical max** to "now". That counter wraps every 65.536 s, so across a wrap the numerical max isn't the temporally-latest entry — post-wrap frames got shoved up to ~65 s into the past. Analysis of a real session showed **1141 backward time jumps of ~43–65 s** (plus hundreds of smaller ones); the in-window ones are the stray lines on the live graph, and all of them blur the discovery correlation's time alignment. Fixed with **signed circular offsets** from a pivot (entries in a packet are within a few hundred ms, far under the ±32768 ms unambiguous range), so the latest entry maps to `now` and ordering is preserved across wraps. Verified the math against a wrap-straddling packet.
+- **Defensive chart hardening** (`SignalGraphScreen.drawLineChart`): draw strictly left-to-right (sort only if needed) and break the path on any non-finite value, so a stray timestamp/sample can never render a line jumping across the chart.
+
+### Changed
+- **Settings: "Recent commits" (up to 4 rows) → "Last commit" (single row).** The commit list was pushing the Pull/Push from Git actions off-screen; showing only the latest commit keeps them visible.
+
+### Verified
+- New on-device recording (~60 s, crossing a counter wrap) shows **0 backward timestamp jumps** (old data had 1141 large + thousands of small).
+
+## 2026-06-12 (session 30 — Add-to-DBC hand-off + already-mapped indicator)
+
+### Added
+- **"Add" on each Discover hit opens the signal editor pre-filled** (Phase 11.7) — no more hand-copying `SG_` lines. The hit's bit window, endianness, signedness, factor/offset, unit, suggested name (`<CHANNEL>_<startBit>`), message name and DLC are stashed (`CanBusViewModel.SignalPrefill` / `setPendingPrefill` / `takePendingPrefill`) and seeded into `SignalEditorScreen`'s form for a new signal. Writes go through the existing editor → `DbcWriter` to the **active** DBC (one DBC per vehicle). "Copy SG_" is still there as a fallback. Add one at a time; after saving you return to the results to add the next.
+- **Already-mapped indicator.** Each hit now shows whether its bits re-detect an existing signal: `≈ <SignalName> (already mapped)` (de-emphasized) vs `new in <MESSAGE>` for undecoded bits of a known message vs nothing for an unknown ID. `ScanHit` gained `overlapsSignal` (best-overlap defined signal, ≥25% of the candidate's bits) and `dlc`. This resolves the "I went from 4 to 12 speed hits and can't tell which 8 are already mapped" problem.
+
+### Verified
+- Compiles; 6 test files green (33 tests); APK installed. On-device promotion flow to be confirmed.
+
+## 2026-06-12 (session 29 — fix frozen IMU quaternion)
+
+### Fixed
+- **Frozen IMU quaternion (firmware v1.5.2).** The orientation quaternion was constant across a whole recording while gyro/accel streamed normally. Root cause, confirmed with an LED report-streaming probe: enabling three *fused* reports at 50 Hz (rotation vector + linear accel + gyro) starves the BNO085's scheduler and the rotation-vector report dies after the first sample. Fix: run the **game rotation vector at 10 Hz** (`kImuRvReportMs`) while gyro/accel stay 50 Hz — the probe showed the report streams reliably again. Also switched plain Rotation Vector → **Game Rotation Vector** (gyro+accel fusion, no magnetometer) along the way, which is more robust in a car and still gravity-referenced (all the yaw projection / future accel-frame rotation need). Orientation changes slowly, so 10 Hz is plenty; yaw rate still comes from the 50 Hz gyro.
+- This unblocks the lateral/longitudinal **accel** channels (11.6), which need live orientation. It didn't affect yaw (gravity projection ≈ raw gz at small tilt).
+
+### Changed
+- `scripts/build_and_stage_firmware.sh` paths made rename-proof (derive from the project dir, not a hardcoded `phone_companion`) — fixes staging after the `dbc-forge` rename.
+
+## 2026-06-12 (session 28 — Discover scans known messages; first road-data validation)
+
+### Changed
+- **Discover now scans all CAN IDs, not just unknown ones.** Previously the full "Discover" sweep skipped any ID already in the DBC, so signals living in *partially-decoded* messages were invisible. It now scans known messages too but **suppresses candidates that overlap already-defined signal bits** (`SignalCorrelator.bitsCovered` made public; >50%-covered windows dropped), so it surfaces *new/undecoded* signals without re-reporting what's mapped. Hits on known IDs are tagged `in <MESSAGE> (undecoded bits)` in the results. Per-ID "Find signal (this ID)" still shows everything (incl. overlapping bits) so a misplaced definition can be corrected against ground truth.
+
+### Validated (first real drive — 2008 Impala HS-CAN)
+- Correlator confirmed against ground truth: vehicle-speed message `0x3E9` hit **r=0.999 at bit 7 / len 16 / Motorola**, exactly matching the DBC's `VehicleSpeed : 7|16@0+`. GPS-speed discovery surfaced 4 hits on the live drive.
+- **Yaw rate is not on this bus.** Ran the correlator over the recorded IMU yaw (good data: −41…+31 °/s, real turns) against all 50 captured IDs — nothing above ~0.55, and those at 1.6–2.0 s lag (spurious). Notably **485/489 (the DBC's guessed `YawRate` locations) do not correlate** — consistent with those messages' own "verify with moving vehicle / may be wrong" comments. The Impala's yaw/ESP data is likely on a bus not reachable via the OBD-II HS-CAN pins.
+
+### Known issue
+- **BNO085 rotation-vector (quaternion) is frozen** in recordings — same value every sample, while gyro/accel update normally. Harmless for yaw here (the gravity projection ≈ raw gz at small mount tilt), but it must be fixed before the lateral/longitudinal **accel** channels (11.6), which depend on live orientation. To investigate: whether `enableRotationVector` is being starved/disabled or `getQuat*` is returning a stale cache.
+
+### Note
+- Project directory renamed `phone_companion` → `dbc-forge`; updated `android_app/local.properties` `sdk.dir`. CLAUDE.md tool-path table and `scripts/` still reference the old name — update when convenient.
+
 ## 2026-06-12 (session 27 — fix git sync from the phone)
 
 ### Fixed
