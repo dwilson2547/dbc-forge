@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-03 (firmware 1.6.0 / 1.6.1 — MTU-sized notifications, CAN filter, steady IMU)
+
+### Fixed
+- **Notifications longer than the BLE MTU were silently cut short.** The dongle negotiated a 256-byte ATT MTU (NimBLE's default preferred MTU) but sent up to 512 bytes per notification, so everything past byte 253 was lost: under CAN load that was the IMU line (appended last) and any CAN frames after it, and a cut line could still parse with a shortened timestamp counter. Notifications are now filled only up to the negotiated MTU − 3, and the dongle asks for a 517-byte MTU (`NimBLEDevice::setMTU`); a phone that agrees gets 514-byte notifications. Found from the robo-services phone gateway, which counts cut-off notifications.
+- **Lines were dropped when the buffer was full** (`appendFrame`/`appendImu` returned without flushing). A line that does not fit now flushes first; a notification the stack refuses (no buffer space) is kept and retried instead of discarded.
+- **IMU rate sagged to ~26–44 Hz under CAN load.** The 50 Hz timer reset to `millis()` on each emit, so time spent draining CAN stretched every interval. It now advances by the period (resyncing if more than one period behind) and is also checked inside the CAN drain loop (1.6.1).
+
+### Added
+- **`FILTER:<hex>,<hex>,...` command** on the NUS RX characteristic: forward only those CAN ids (up to 64); `FILTER:` forwards everything again. Reset on every connect, so dbc-forge, which never sends it, always sees the whole bus. The Impala's 23 DBC ids are about half its HS-CAN frame rate.
+
+### Not yet done
+- `android_app/app/src/main/assets/firmware/firmware.bin` (the OTA bundle) is still the previous build; rebundle once 1.6.1 is confirmed on the bench.
+
 ## 2026-06-12 (session 32 — lateral/longitudinal accel discovery (11.11))
 
 ### Added

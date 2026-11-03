@@ -15,6 +15,8 @@
  *     RX write:   6E400002-B5A3-F393-E0A9-E50E24DCCA9E  (commands → dongle)
  *       Commands: "TX_ENABLE"  — switch TWAI to NORMAL mode, assert S pin HIGH
  *                 "TX_DISABLE" — switch TWAI to LISTEN_ONLY, pull S pin LOW
+ *                 "FILTER:<hex>,<hex>,..." — forward only these CAN ids (max 64);
+ *                 "FILTER:" forwards every id again. Reset on every connect.
  *
  *   OTA service — firmware update over BLE
  *     Control write:  6E410002-B5A3-F393-E0A9-E50E24DCCA9E
@@ -30,7 +32,9 @@
  * Frame packing:
  * - Multiple CAN frames are batched into a single BLE notification.
  * - Loop drains the TWAI queue non-blocking, then waits up to kFlushIntervalMs
- *   before flushing. Early flush fires when the buffer exceeds kFlushThreshold.
+ *   before flushing. A notification is never longer than the negotiated ATT MTU
+ *   allows (MTU - 3, at most kBufSize): the stack would cut a longer one short. A
+ *   line that would not fit flushes the buffer first.
  * - CAN processing is paused during OTA to avoid BLE congestion.
  *
  * TX mode safety:
@@ -58,7 +62,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.5.2";
+constexpr char kFirmwareVersion[] = "1.6.1";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -82,8 +86,10 @@ constexpr int      kImuDrainMax    = 8;        // max sensor events serviced per
 
 // Frame packing
 constexpr uint32_t kFlushIntervalMs = 10;
-constexpr int      kBufSize         = 512;
-constexpr int      kFlushThreshold  = 400;
+constexpr int      kBufSize         = 512;    // largest notification, used when the MTU allows
+constexpr int      kMaxLineLen      = 128;    // longest line (IMU); flush once less than this is left
+constexpr uint16_t kPreferredMtu    = 517;    // asked for at init; the phone may settle lower
+constexpr int      kMaxFilterIds    = 64;     // FILTER command capacity
 
 // OTA progress notification interval (bytes between PROGRESS notifications)
 constexpr size_t kOtaProgressInterval = 16 * 1024;
@@ -119,6 +125,24 @@ int  gTxBufLen = 0;
 volatile bool     gReinitRequested = false;
 volatile bool     gReinitTxTarget  = false;
 volatile uint32_t gReinitBaudRate  = 500000;   // default; updated by BAUD command
+
+// Largest notification payload the connection carries: ATT MTU - 3. The stack
+// silently truncates a longer notification, so the TX buffer is filled only to this.
+// 20 until the MTU exchange (default ATT MTU 23).
+volatile int      gNotifyMax       = 20;
+
+// CAN id allowlist from the FILTER command; empty = forward every frame. Written by
+// the BLE task into gPendingFilter, applied by loop() (same hand-off as gReinit*).
+uint32_t          gFilterIds[kMaxFilterIds];
+int               gFilterCount     = 0;
+uint32_t          gPendingFilter[kMaxFilterIds];
+volatile int      gPendingFilterCount = 0;
+volatile bool     gFilterRequested = false;
+
+void flushBuf();
+bool appendLine(const char* line, int len);
+void serviceImu();
+void appendImu();
 
 // Bus-off recovery timing
 uint32_t gLastBusOffCheckMs    = 0;
@@ -304,6 +328,21 @@ class NusRxCallbacks : public NimBLECharacteristicCallbacks {
             } else {
                 Serial.printf("[CMD] BAUD: unsupported rate %lu\n", baud);
             }
+        } else if (val.rfind("FILTER:", 0) == 0) {
+            // FILTER:<hex id>,<hex id>,...  forward only these CAN ids
+            // FILTER:  (empty)              forward every id again
+            int n = 0;
+            const char* p = val.c_str() + 7;
+            while (*p && n < kMaxFilterIds) {
+                char* end = nullptr;
+                const unsigned long id = strtoul(p, &end, 16);
+                if (end == p) break;
+                gPendingFilter[n++] = static_cast<uint32_t>(id);
+                p = (*end == ',') ? end + 1 : end;
+            }
+            gPendingFilterCount = n;
+            gFilterRequested    = true;
+            Serial.printf("[CMD] FILTER: %d id(s)\n", n);
         } else {
             Serial.printf("[CMD] Unknown command: %s\n", val.c_str());
         }
@@ -312,18 +351,33 @@ class NusRxCallbacks : public NimBLECharacteristicCallbacks {
 
 // ── NUS server callbacks ──────────────────────────────────────────────────────
 
+int notifyMaxFor(uint16_t mtu) {
+    const int payload = static_cast<int>(mtu) - 3;
+    return payload < kBufSize ? payload : kBufSize;
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
-        (void)server; (void)connInfo;
+        (void)server;
         gClientConnected = true;
         gTxBufLen = 0;
+        gNotifyMax = notifyMaxFor(connInfo.getMTU());
+        gPendingFilterCount = 0;  // every client starts unfiltered
+        gFilterRequested    = true;
         ledOn();
         Serial.println("[BLE] Client connected");
+    }
+
+    void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override {
+        (void)connInfo;
+        gNotifyMax = notifyMaxFor(mtu);
+        Serial.printf("[BLE] MTU %u -> notifications up to %d bytes\n", mtu, (int)gNotifyMax);
     }
 
     void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
         (void)server; (void)connInfo; (void)reason;
         gClientConnected = false;
+        gNotifyMax = 20;
         if (gOtaPhase != OtaPhase::IDLE) {
             otaAbort();
             Serial.println("[OTA] Aborted — client disconnected");
@@ -344,6 +398,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 void initBle() {
     NimBLEDevice::init("CAN-DONGLE");
     NimBLEDevice::setPower(9);
+    // NimBLE's default preferred MTU is ~255, which caps a notification at ~252 bytes.
+    NimBLEDevice::setMTU(kPreferredMtu);
 
     gServer = NimBLEDevice::createServer();
     gServer->setCallbacks(new ServerCallbacks());
@@ -421,7 +477,23 @@ bool appendFrame(const twai_message_t& msg) {
     }
     len += snprintf(line + len, sizeof(line) - len, ",%u", (unsigned)(millis() % 65536));
     line[len++] = '\n';
-    if (gTxBufLen + len > kBufSize) return false;
+    return appendLine(line, len);
+}
+
+bool canIdWanted(uint32_t id) {
+    if (gFilterCount == 0) return true;
+    for (int i = 0; i < gFilterCount; i++) {
+        if (gFilterIds[i] == id) return true;
+    }
+    return false;
+}
+
+// Append one whole line. A notification must fit the negotiated MTU, or the stack
+// cuts it short, so flush first when the line would not fit. Returns false (line
+// dropped) only if the previous notification could not be sent yet.
+bool appendLine(const char* line, int len) {
+    if (gTxBufLen + len > gNotifyMax) flushBuf();
+    if (gTxBufLen + len > gNotifyMax) return false;
     memcpy(gTxBuf + gTxBufLen, line, len);
     gTxBufLen += len;
     return true;
@@ -433,8 +505,8 @@ void flushBuf() {
         return;
     }
     gTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(gTxBuf), gTxBufLen);
-    gTxCharacteristic->notify();
-    gTxBufLen = 0;
+    // Keep the buffer if the stack has no room for it yet; the next flush retries.
+    if (gTxCharacteristic->notify()) gTxBufLen = 0;
 }
 
 // ── IMU (BNO085) ──────────────────────────────────────────────────────────────
@@ -496,6 +568,20 @@ void serviceImu() {
     }
 }
 
+// Emit an IMU line on a fixed 50 Hz schedule. The schedule advances by the period,
+// not to "now", so time spent draining CAN delays one line without stretching every
+// interval after it (resetting to now made the rate fall to ~40 Hz under CAN load).
+// If it falls more than a period behind, it resyncs instead of bursting lines.
+void emitImuIfDue() {
+    if (!gImuReady) return;
+    const uint32_t now = millis();
+    if (now - gLastImuEmitMs < kImuEmitMs) return;
+    gLastImuEmitMs += kImuEmitMs;
+    if (now - gLastImuEmitMs >= kImuEmitMs) gLastImuEmitMs = now;
+    serviceImu();  // freshest readings for this line
+    appendImu();
+}
+
 // Append a combined IMU line (same trailing millis%65536 timestamp scheme as frames):
 //   IMU,qw,qx,qy,qz,ax,ay,az,gx,gy,gz,<ts>\n
 void appendImu() {
@@ -505,9 +591,8 @@ void appendImu() {
         "IMU,%.4f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%u\n",
         gQw, gQx, gQy, gQz, gAx, gAy, gAz, gGx, gGy, gGz,
         (unsigned)(millis() % 65536));
-    if (len <= 0 || gTxBufLen + len > kBufSize) return;
-    memcpy(gTxBuf + gTxBufLen, line, len);
-    gTxBufLen += len;
+    if (len <= 0) return;
+    appendLine(line, len);
 }
 
 } // namespace
@@ -539,6 +624,15 @@ void setup() {
 }
 
 void loop() {
+    // Apply a FILTER command (or the reset on connect). Clear the flag before copying:
+    // a command arriving mid-copy sets it again and is applied on the next pass.
+    if (gFilterRequested) {
+        gFilterRequested = false;
+        const int n = gPendingFilterCount;
+        memcpy(gFilterIds, gPendingFilter, n * sizeof(uint32_t));
+        gFilterCount = n;
+    }
+
     // Restart advertising if client dropped
     if (!gClientConnected && gAdvertising != nullptr &&
         millis() - gLastAdvCheckMs >= 2000) {
@@ -574,11 +668,12 @@ void loop() {
     if (gCanReady) {
         twai_message_t msg;
         while (twai_receive(&msg, 0) == ESP_OK) {
-            appendFrame(msg);
-            if (gTxBufLen >= kFlushThreshold) flushBuf();
+            if (canIdWanted(msg.identifier)) appendFrame(msg);
+            if (gTxBufLen > gNotifyMax - kMaxLineLen) flushBuf();
+            emitImuIfDue();  // a long CAN burst must not hold the IMU back
         }
         if (twai_receive(&msg, pdMS_TO_TICKS(kFlushIntervalMs)) == ESP_OK) {
-            appendFrame(msg);
+            if (canIdWanted(msg.identifier)) appendFrame(msg);
         }
     } else {
         // No CAN pacing — give the IMU a steady cadence without busy-spinning.
@@ -591,10 +686,7 @@ void loop() {
         tryInitImu();
     }
     serviceImu();
-    if (gImuReady && millis() - gLastImuEmitMs >= kImuEmitMs) {
-        gLastImuEmitMs = millis();
-        appendImu();
-    }
+    emitImuIfDue();
 
     flushBuf();
 }
