@@ -17,6 +17,8 @@
  *                 "TX_DISABLE" — switch TWAI to LISTEN_ONLY, pull S pin LOW
  *                 "FILTER:<hex>,<hex>,..." — forward only these CAN ids (max 64);
  *                 "FILTER:" forwards every id again. Reset on every connect.
+ *   TX notify also carries a diagnostics line every 5 s (1.6.2+):
+ *     STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms
  *
  *   OTA service — firmware update over BLE
  *     Control write:  6E410002-B5A3-F393-E0A9-E50E24DCCA9E
@@ -62,7 +64,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.6.1";
+constexpr char kFirmwareVersion[] = "1.6.2";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -138,6 +140,12 @@ int               gFilterCount     = 0;
 uint32_t          gPendingFilter[kMaxFilterIds];
 volatile int      gPendingFilterCount = 0;
 volatile bool     gFilterRequested = false;
+
+// Counters printed every kStatIntervalMs as one "[STAT]" serial line, then reset.
+uint32_t gStatImuLines = 0, gStatImuDropped = 0, gStatImuEvents = 0, gStatImuResets = 0;
+uint32_t gStatCanFrames = 0, gStatCanDropped = 0, gStatNotifyFails = 0, gStatMaxPassMs = 0;
+uint32_t gLastStatMs = 0;
+constexpr uint32_t kStatIntervalMs = 5000;
 
 void flushBuf();
 bool appendLine(const char* line, int len);
@@ -477,7 +485,9 @@ bool appendFrame(const twai_message_t& msg) {
     }
     len += snprintf(line + len, sizeof(line) - len, ",%u", (unsigned)(millis() % 65536));
     line[len++] = '\n';
-    return appendLine(line, len);
+    const bool ok = appendLine(line, len);
+    if (ok) gStatCanFrames++; else gStatCanDropped++;
+    return ok;
 }
 
 bool canIdWanted(uint32_t id) {
@@ -507,6 +517,7 @@ void flushBuf() {
     gTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(gTxBuf), gTxBufLen);
     // Keep the buffer if the stack has no room for it yet; the next flush retries.
     if (gTxCharacteristic->notify()) gTxBufLen = 0;
+    else gStatNotifyFails++;
 }
 
 // ── IMU (BNO085) ──────────────────────────────────────────────────────────────
@@ -548,8 +559,12 @@ void initImu() {
 // Drain pending sensor events into the latest-value cache (non-blocking, bounded).
 void serviceImu() {
     if (!gImuReady) return;
-    if (gImu.wasReset()) enableImuReports();
+    if (gImu.wasReset()) {
+        gStatImuResets++;
+        enableImuReports();
+    }
     for (int i = 0; i < kImuDrainMax && gImu.getSensorEvent(); i++) {
+        gStatImuEvents++;
         switch (gImu.getSensorEventID()) {
             case SENSOR_REPORTID_GAME_ROTATION_VECTOR:
                 gQw = gImu.getGameQuatReal(); gQx = gImu.getGameQuatI();
@@ -592,7 +607,7 @@ void appendImu() {
         gQw, gQx, gQy, gQz, gAx, gAy, gAz, gGx, gGy, gGz,
         (unsigned)(millis() % 65536));
     if (len <= 0) return;
-    appendLine(line, len);
+    if (appendLine(line, len)) gStatImuLines++; else gStatImuDropped++;
 }
 
 } // namespace
@@ -623,7 +638,30 @@ void setup() {
     initImu();
 }
 
+void printStats() {
+    const uint32_t now = millis();
+    if (now - gLastStatMs < kStatIntervalMs) return;
+    gLastStatMs = now;
+    Serial.printf("[STAT] imu_lines=%lu imu_drop=%lu imu_events=%lu imu_resets=%lu imu_ready=%d "
+                  "can=%lu can_drop=%lu notify_fail=%lu max_pass_ms=%lu mtu_payload=%d filter=%d\n",
+                  gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets, (int)gImuReady,
+                  gStatCanFrames, gStatCanDropped, gStatNotifyFails, gStatMaxPassMs,
+                  (int)gNotifyMax, gFilterCount);
+    // Same counters to the phone, so they can be read while the dongle is on a bus
+    // and not on USB: STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,
+    // can,can_drop,notify_fail,max_pass_ms
+    char line[128];
+    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu\n",
+                             gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets,
+                             (int)gImuReady, gStatCanFrames, gStatCanDropped, gStatNotifyFails,
+                             gStatMaxPassMs);
+    if (len > 0 && gClientConnected) appendLine(line, len);
+    gStatImuLines = gStatImuDropped = gStatImuEvents = gStatImuResets = 0;
+    gStatCanFrames = gStatCanDropped = gStatNotifyFails = gStatMaxPassMs = 0;
+}
+
 void loop() {
+    const uint32_t passStart = millis();
     // Apply a FILTER command (or the reset on connect). Clear the flag before copying:
     // a command arriving mid-copy sets it again and is applied on the next pass.
     if (gFilterRequested) {
@@ -689,4 +727,7 @@ void loop() {
     emitImuIfDue();
 
     flushBuf();
+    const uint32_t pass = millis() - passStart;
+    if (pass > gStatMaxPassMs) gStatMaxPassMs = pass;
+    printStats();
 }
