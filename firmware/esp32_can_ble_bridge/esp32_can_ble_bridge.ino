@@ -18,7 +18,8 @@
  *                 "FILTER:<hex>,<hex>,..." — forward only these CAN ids (max 64);
  *                 "FILTER:" forwards every id again. Reset on every connect.
  *   TX notify also carries a diagnostics line every 5 s (1.6.2+):
- *     STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms
+ *     STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms,
+ *          notifies,notify_bytes   (the last two since 1.6.3)
  *
  *   OTA service — firmware update over BLE
  *     Control write:  6E410002-B5A3-F393-E0A9-E50E24DCCA9E
@@ -34,7 +35,8 @@
  * Frame packing:
  * - Multiple CAN frames are batched into a single BLE notification.
  * - Loop drains the TWAI queue non-blocking, then waits up to kFlushIntervalMs
- *   before flushing. A notification is never longer than the negotiated ATT MTU
+ *   before flushing. A notification is sent when nearly full or when its oldest line
+ *   is kMaxBufferAgeMs old, not on every pass. It is never longer than the negotiated ATT MTU
  *   allows (MTU - 3, at most kBufSize): the stack would cut a longer one short. A
  *   line that would not fit flushes the buffer first.
  * - CAN processing is paused during OTA to avoid BLE congestion.
@@ -64,7 +66,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.6.2";
+constexpr char kFirmwareVersion[] = "1.6.4";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -92,6 +94,10 @@ constexpr int      kBufSize         = 512;    // largest notification, used when
 constexpr int      kMaxLineLen      = 128;    // longest line (IMU); flush once less than this is left
 constexpr uint16_t kPreferredMtu    = 517;    // asked for at init; the phone may settle lower
 constexpr int      kMaxFilterIds    = 64;     // FILTER command capacity
+// A partly filled notification is sent once its oldest line is this old. Flushing on
+// every loop pass sent ~210 notifications/s of ~100 bytes, and phones drop some at
+// that rate (measured: up to 15% lost); this keeps them near full at ~45/s.
+constexpr uint32_t kMaxBufferAgeMs  = 50;
 
 // OTA progress notification interval (bytes between PROGRESS notifications)
 constexpr size_t kOtaProgressInterval = 16 * 1024;
@@ -144,7 +150,9 @@ volatile bool     gFilterRequested = false;
 // Counters printed every kStatIntervalMs as one "[STAT]" serial line, then reset.
 uint32_t gStatImuLines = 0, gStatImuDropped = 0, gStatImuEvents = 0, gStatImuResets = 0;
 uint32_t gStatCanFrames = 0, gStatCanDropped = 0, gStatNotifyFails = 0, gStatMaxPassMs = 0;
+uint32_t gStatNotifies = 0, gStatNotifyBytes = 0;
 uint32_t gLastStatMs = 0;
+uint32_t gBufFirstLineMs = 0;   // when the oldest line in gTxBuf was added
 constexpr uint32_t kStatIntervalMs = 5000;
 
 void flushBuf();
@@ -504,6 +512,7 @@ bool canIdWanted(uint32_t id) {
 bool appendLine(const char* line, int len) {
     if (gTxBufLen + len > gNotifyMax) flushBuf();
     if (gTxBufLen + len > gNotifyMax) return false;
+    if (gTxBufLen == 0) gBufFirstLineMs = millis();
     memcpy(gTxBuf + gTxBufLen, line, len);
     gTxBufLen += len;
     return true;
@@ -516,8 +525,13 @@ void flushBuf() {
     }
     gTxCharacteristic->setValue(reinterpret_cast<uint8_t*>(gTxBuf), gTxBufLen);
     // Keep the buffer if the stack has no room for it yet; the next flush retries.
-    if (gTxCharacteristic->notify()) gTxBufLen = 0;
-    else gStatNotifyFails++;
+    if (gTxCharacteristic->notify()) {
+        gStatNotifies++;
+        gStatNotifyBytes += gTxBufLen;
+        gTxBufLen = 0;
+    } else {
+        gStatNotifyFails++;
+    }
 }
 
 // ── IMU (BNO085) ──────────────────────────────────────────────────────────────
@@ -649,15 +663,16 @@ void printStats() {
                   (int)gNotifyMax, gFilterCount);
     // Same counters to the phone, so they can be read while the dongle is on a bus
     // and not on USB: STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,
-    // can,can_drop,notify_fail,max_pass_ms
-    char line[128];
-    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu\n",
+    // can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes
+    char line[160];
+    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
                              gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets,
                              (int)gImuReady, gStatCanFrames, gStatCanDropped, gStatNotifyFails,
-                             gStatMaxPassMs);
+                             gStatMaxPassMs, gStatNotifies, gStatNotifyBytes);
     if (len > 0 && gClientConnected) appendLine(line, len);
     gStatImuLines = gStatImuDropped = gStatImuEvents = gStatImuResets = 0;
     gStatCanFrames = gStatCanDropped = gStatNotifyFails = gStatMaxPassMs = 0;
+    gStatNotifies = gStatNotifyBytes = 0;
 }
 
 void loop() {
@@ -726,7 +741,7 @@ void loop() {
     serviceImu();
     emitImuIfDue();
 
-    flushBuf();
+    if (gTxBufLen > 0 && millis() - gBufFirstLineMs >= kMaxBufferAgeMs) flushBuf();
     const uint32_t pass = millis() - passStart;
     if (pass > gStatMaxPassMs) gStatMaxPassMs = pass;
     printStats();

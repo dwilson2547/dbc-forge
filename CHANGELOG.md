@@ -1,14 +1,16 @@
 # Changelog
 
-## 2026-11-03 (firmware 1.6.0–1.6.2 — MTU-sized notifications, CAN filter, steady IMU, diagnostics)
+## 2026-11-03 (firmware 1.6.0–1.6.4 — MTU-sized notifications, CAN filter, steady IMU, no lost notifications)
 
 ### Fixed
 - **Notifications longer than the BLE MTU were silently cut short.** The dongle negotiated a 256-byte ATT MTU (NimBLE's default preferred MTU) but sent up to 512 bytes per notification, so everything past byte 253 was lost: under CAN load that was the IMU line (appended last) and any CAN frames after it, and a cut line could still parse with a shortened timestamp counter. Notifications are now filled only up to the negotiated MTU − 3, and the dongle asks for a 517-byte MTU (`NimBLEDevice::setMTU`); a phone that agrees gets 514-byte notifications. Found from the robo-services phone gateway, which counts cut-off notifications.
 - **Lines were dropped when the buffer was full** (`appendFrame`/`appendImu` returned without flushing). A line that does not fit now flushes first; a notification the stack refuses (no buffer space) is kept and retried instead of discarded.
 - **IMU rate sagged to ~26–44 Hz under CAN load.** The 50 Hz timer reset to `millis()` on each emit, so time spent draining CAN stretched every interval. It now advances by the period (resyncing if more than one period behind) and is also checked inside the CAN drain loop (1.6.1).
 
+- **Phones lost up to 15% of notifications (1.6.4).** The buffer was flushed at the end of every loop pass: ~210 notifications/s averaging ~104 bytes. Comparing the firmware's sent count with what the phone app received over the same 5 s showed whole notifications missing in many windows although every `notify()` had succeeded. A notification is now sent when nearly full or when its oldest line is 50 ms old (`kMaxBufferAgeMs`): ~50/s at ~430 bytes, and every window then matched sent = received. On the bench (Impala CAN replay, 23-id filter) 90 of 90 seconds carried full 50 Hz IMU.
+
 ### Added
-- **Diagnostics every 5 s (1.6.2):** a `[STAT]` serial line and the same counters as a `STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms` line over NUS TX, so they can be read from the phone while the dongle is on a bus (it cannot be on USB and the bench CAN simulator at once). dbc-forge's app counts the STAT line as one unparsed line per 5 s until it learns to skip it.
+- **Diagnostics every 5 s (1.6.2):** a `[STAT]` serial line and the same counters as a `STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes` line over NUS TX (the last two from 1.6.3), so they can be read from the phone while the dongle is on a bus (it cannot be on USB and the bench CAN simulator at once). dbc-forge's app counts the STAT line as one unparsed line per 5 s until it learns to skip it.
 - **`FILTER:<hex>,<hex>,...` command** on the NUS RX characteristic: forward only those CAN ids (up to 64); `FILTER:` forwards everything again. Reset on every connect, so dbc-forge, which never sends it, always sees the whole bus. The Impala's 23 DBC ids are about half its HS-CAN frame rate.
 
 ### Not yet done
