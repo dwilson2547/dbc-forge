@@ -66,8 +66,11 @@
  * - esp_ota_end() validates the image magic and SHA256 before committing.
  * - The inactive partition is written; the active partition is unchanged until
  *   esp_ota_set_boot_partition() is called after successful verification.
- * - esp_ota_mark_app_valid_cancel_rollback() is called in setup() so the
- *   bootloader does not roll back to the previous image on the next boot.
+ * - COMMIT is verified and applied from loop(), after its write has been acknowledged
+ *   (1.7.1; before, the dongle restarted inside the write and COMMIT was never acked).
+ * - A new image is marked valid only once a phone has connected over BLE (1.7.1;
+ *   before, at the start of setup()). An image that boots but can't serve BLE stays
+ *   pending, and the bootloader rolls back to the previous one on the next reset.
  */
 
 #include <Arduino.h>
@@ -80,7 +83,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.7.0";
+constexpr char kFirmwareVersion[] = "1.7.1";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -205,6 +208,8 @@ const esp_partition_t* gOtaPartition     = nullptr;
 size_t                 gOtaExpectedBytes = 0;
 size_t                 gOtaBytesWritten  = 0;
 size_t                 gOtaLastProgress  = 0;
+volatile bool          gOtaCommitRequested = false;  // set by the COMMIT write, applied by loop()
+volatile bool          gMarkValidRequested = false;  // set on a BLE connect, applied by loop()
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -215,6 +220,38 @@ void otaNotify(const char* msg) {
     if (gOtaStatusChar && gClientConnected) {
         gOtaStatusChar->setValue(msg);
         gOtaStatusChar->notify();
+    }
+}
+
+// Verify the received image, switch the boot partition and restart (from loop()).
+void otaCommit() {
+    otaNotify("VERIFYING");
+    Serial.printf("[OTA] Verifying — %u / %u bytes\n", gOtaBytesWritten, gOtaExpectedBytes);
+    esp_err_t err = esp_ota_end(gOtaHandle);
+    gOtaHandle = 0;
+    if (err != ESP_OK) {
+        char msg[40];
+        snprintf(msg, sizeof(msg), "ERROR:verify_failed_%d", err);
+        otaNotify(msg);
+        gOtaPhase = OtaPhase::IDLE;
+        return;
+    }
+    err = esp_ota_set_boot_partition(gOtaPartition);
+    if (err != ESP_OK) { otaNotify("ERROR:set_boot_failed"); gOtaPhase = OtaPhase::IDLE; return; }
+    otaNotify("OK");
+    Serial.println("[OTA] Success — restarting");
+    delay(500);  // let OK reach the phone
+    esp_restart();
+}
+
+// A phone reached this image over BLE: keep it (cancels the bootloader's rollback).
+void markAppValid() {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        Serial.println("[OTA] New image confirmed by a BLE connection");
     }
 }
 
@@ -305,25 +342,9 @@ class OtaCtrlCallbacks : public NimBLECharacteristicCallbacks {
 
         } else if (val == "COMMIT") {
             if (gOtaPhase != OtaPhase::RECEIVING) { otaNotify("ERROR:not_receiving"); return; }
+            // Verify and restart from loop(): returning here lets the stack acknowledge the write
             gOtaPhase = OtaPhase::COMMITTING;
-            otaNotify("VERIFYING");
-            Serial.printf("[OTA] Verifying — %u / %u bytes\n", gOtaBytesWritten, gOtaExpectedBytes);
-
-            esp_err_t err = esp_ota_end(gOtaHandle);
-            gOtaHandle = 0;
-            if (err != ESP_OK) {
-                char msg[40];
-                snprintf(msg, sizeof(msg), "ERROR:verify_failed_%d", err);
-                otaNotify(msg);
-                gOtaPhase = OtaPhase::IDLE;
-                return;
-            }
-            err = esp_ota_set_boot_partition(gOtaPartition);
-            if (err != ESP_OK) { otaNotify("ERROR:set_boot_failed"); gOtaPhase = OtaPhase::IDLE; return; }
-            otaNotify("OK");
-            Serial.println("[OTA] Success — restarting");
-            delay(300);
-            esp_restart();
+            gOtaCommitRequested = true;
 
         } else if (val == "ABORT") {
             otaAbort();
@@ -418,6 +439,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         gFilterRequested    = true;
         gAckPolicy          = AckPolicy::AUTO;  // and with the default ack policy
         gAckPolicyChanged   = true;
+        gMarkValidRequested = true;             // a phone can reach this image: keep it
         ledOn();
         Serial.println("[BLE] Client connected");
     }
@@ -690,7 +712,7 @@ void setup() {
     Serial.begin(115200);
     delay(300);
 
-    esp_ota_mark_app_valid_cancel_rollback();
+    // Not marked valid here: see "OTA safety" (markAppValid on the first BLE connect).
 
     initBle();
     gCanReady = initCan();
@@ -792,6 +814,15 @@ void loop() {
     if (gReinitRequested) {
         gReinitRequested = false;
         reinitCan(gReinitTxTarget);
+    }
+
+    if (gMarkValidRequested) {
+        gMarkValidRequested = false;
+        markAppValid();
+    }
+    if (gOtaCommitRequested) {
+        gOtaCommitRequested = false;
+        otaCommit();  // restarts on success
     }
 
     // Pause CAN streaming during OTA
