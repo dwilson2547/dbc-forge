@@ -7,19 +7,27 @@
  * - Seeed Studio XIAO ESP32-C6  — D0=GPIO0, D1=GPIO1, D2=GPIO2, LED=GPIO15
  *   FQBN: esp32:esp32:XIAO_ESP32C6
  * - TJA1051 CAN transceiver: TX->D0, RX<-D1, S<-D2
- *   S pin is held LOW (listen-only) on boot; driven HIGH to enable TX mode.
+ *   S HIGH = Silent (transmitter off), S LOW = Normal (NXP TJA1051 Rev. 9, 7.1).
+ *   Held HIGH on boot; LOW only in ack mode (see "CAN modes").
  *
  * BLE services:
  *   NUS (Nordic UART Service) — CAN frame streaming + command channel
  *     TX notify:  6E400003-B5A3-F393-E0A9-E50E24DCCA9E  (frames → phone)
  *     RX write:   6E400002-B5A3-F393-E0A9-E50E24DCCA9E  (commands → dongle)
- *       Commands: "TX_ENABLE"  — switch TWAI to NORMAL mode, assert S pin HIGH
- *                 "TX_DISABLE" — switch TWAI to LISTEN_ONLY, pull S pin LOW
+ *       Commands: "ACK:AUTO" — listen, then acknowledge once the bus is proven (default,
+ *                              restored on every connect)
+ *                 "ACK:OFF"  — listen only
+ *                 "ACK:ON"   — acknowledge now, without the proof
+ *                 "TX_ENABLE" / "TX_DISABLE" — the same as ACK:ON / ACK:OFF
+ *                 "BAUD:<rate>" — 125000, 250000, 500000 or 1000000; back to listen
  *                 "FILTER:<hex>,<hex>,..." — forward only these CAN ids (max 64);
  *                 "FILTER:" forwards every id again. Reset on every connect.
  *   TX notify also carries a diagnostics line every 5 s (1.6.2+):
  *     STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms,
- *          notifies,notify_bytes   (the last two since 1.6.3)
+ *          notifies,notify_bytes,can_mode,can_repeats,bus_errors
+ *     notifies and notify_bytes since 1.6.3; the last three since 1.7.0:
+ *     can_mode 0 = listen, 1 = ack, 2 = listen after an ack fallback; can_repeats = frames
+ *     identical to the frame just before (id, data, same ms); bus_errors in the window.
  *
  *   OTA service — firmware update over BLE
  *     Control write:  6E410002-B5A3-F393-E0A9-E50E24DCCA9E
@@ -41,12 +49,18 @@
  *   line that would not fit flushes the buffer first.
  * - CAN processing is paused during OTA to avoid BLE congestion.
  *
- * TX mode safety:
- * - S pin is LOW (listen-only) on every boot regardless of last state.
- * - TX_ENABLE must be sent explicitly by the phone each session.
- * - No CAN frames are transmitted by this firmware (TX mode reserved for Phase 7).
- *   TX_ENABLE only unlocks the transceiver hardware; the TWAI driver still has
- *   no frames queued to send.
+ * CAN modes (1.7.0):
+ * - Listen: TWAI LISTEN_ONLY and the transceiver Silent. Passive twice over. Every boot,
+ *   every disconnect and every BAUD change starts here.
+ * - Ack: TWAI NORMAL and the transceiver Normal. A sender resends a frame until some node
+ *   acknowledges it; on a port with no other listener (a 2024 Blazer, 2026-11-04) a
+ *   listen-only dongle records every resend. No CAN frames are transmitted by this
+ *   firmware (twai_transmit is never called), so ack mode only drives ACK bits and, on
+ *   errors, error flags.
+ * - Auto switches listen -> ack after kAckProofFrames valid frames with fewer than one
+ *   bus error per kAckProofRatio of them. A wrong bitrate gives almost no valid frames,
+ *   so the dongle never joins a bus it can't read. Errors in ack mode (warning level,
+ *   bus-off, or errors above that ratio) fall back to listen until the next connect.
  *
  * OTA safety:
  * - esp_ota_end() validates the image magic and SHA256 before committing.
@@ -66,7 +80,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.6.4";
+constexpr char kFirmwareVersion[] = "1.7.0";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -75,7 +89,7 @@ namespace {
 // ── Pin config (XIAO ESP32-C6) ────────────────────────────────────────────────
 constexpr gpio_num_t kCanTxPin = GPIO_NUM_0;  // D0
 constexpr gpio_num_t kCanRxPin = GPIO_NUM_1;  // D1
-constexpr gpio_num_t kCanSPin  = GPIO_NUM_2;  // D2 — TJA1051 S pin (LOW=listen, HIGH=normal)
+constexpr gpio_num_t kCanSPin  = GPIO_NUM_2;  // D2 — TJA1051 S pin (HIGH=Silent, LOW=Normal)
 constexpr uint8_t    kLedPin   = 15;
 constexpr uint32_t   kBaud     = 500000;
 
@@ -111,7 +125,21 @@ NimBLEAdvertising*    gAdvertising      = nullptr;
 
 bool     gClientConnected = false;
 bool     gCanReady        = false;
-bool     gTxEnabled       = false;    // current TWAI mode (false = listen-only)
+bool     gTxEnabled       = false;    // current mode: true = ack (NORMAL), false = listen
+
+// Ack policy (see "CAN modes" in the header). Set by commands from the BLE task, read by loop().
+enum class AckPolicy : uint8_t { AUTO, OFF, ON };
+volatile AckPolicy gAckPolicy        = AckPolicy::AUTO;
+volatile bool      gAckPolicyChanged = false;
+bool               gAckFellBack      = false;  // ack mode tripped this connection; stay listening
+constexpr uint32_t kAckProofFrames   = 200;
+constexpr uint32_t kAckProofRatio    = 10;     // at most one bus error per 10 valid frames
+constexpr uint32_t kAckCheckMs       = 250;
+constexpr uint32_t kAckErrorWarn     = 96;     // TWAI error-warning limit
+uint32_t gModeFrames      = 0;   // valid frames since the driver (re)started
+uint32_t gLastAckCheckMs  = 0;
+uint32_t gAckCheckFrames  = 0;   // gModeFrames and bus errors at the previous check
+uint32_t gAckCheckErrors  = 0;
 uint32_t gLastAdvCheckMs  = 0;
 
 // ── IMU state (Phase 11.3) ────────────────────────────────────────────────────
@@ -151,6 +179,9 @@ volatile bool     gFilterRequested = false;
 uint32_t gStatImuLines = 0, gStatImuDropped = 0, gStatImuEvents = 0, gStatImuResets = 0;
 uint32_t gStatCanFrames = 0, gStatCanDropped = 0, gStatNotifyFails = 0, gStatMaxPassMs = 0;
 uint32_t gStatNotifies = 0, gStatNotifyBytes = 0;
+uint32_t gStatCanRepeats = 0, gStatBusErrorsAt = 0;   // repeats in the window; bus errors at its start
+twai_message_t gPrevMsg = {};   // the frame received just before, for the repeat count
+uint32_t       gPrevMsgMs = 0;
 uint32_t gLastStatMs = 0;
 uint32_t gBufFirstLineMs = 0;   // when the oldest line in gTxBuf was added
 constexpr uint32_t kStatIntervalMs = 5000;
@@ -200,6 +231,7 @@ void otaAbort() {
 }
 
 // Stop the TWAI driver, set the S pin, and restart in the requested mode/baud.
+// ack = true: TWAI NORMAL, transceiver Normal (S LOW). false: LISTEN_ONLY, Silent (S HIGH).
 // Must only be called from loop() — not from BLE callback context.
 void reinitCan(bool enableTx) {
     if (gCanReady) {
@@ -208,7 +240,9 @@ void reinitCan(bool enableTx) {
         gCanReady = false;
     }
 
-    digitalWrite(kCanSPin, enableTx ? HIGH : LOW);
+    // Going to listen: the controller is already stopped, so silencing the transceiver
+    // first is safe. Going to ack: the controller starts in NORMAL only after S is LOW.
+    digitalWrite(kCanSPin, enableTx ? LOW : HIGH);
     delay(5); // let the transceiver settle after S-pin change
 
     twai_general_config_t gCfg = TWAI_GENERAL_CONFIG_DEFAULT(
@@ -229,10 +263,13 @@ void reinitCan(bool enableTx) {
         twai_start() == ESP_OK) {
         gCanReady  = true;
         gTxEnabled = enableTx;
+        gModeFrames = gAckCheckFrames = gAckCheckErrors = gStatBusErrorsAt = 0;
         Serial.printf("[CAN] Mode: %s  Baud: %lu\n",
-                      enableTx ? "NORMAL (TX enabled)" : "LISTEN_ONLY", gReinitBaudRate);
+                      enableTx ? "ACK (NORMAL, S=LOW)" : "LISTEN (LISTEN_ONLY, S=HIGH)", gReinitBaudRate);
     } else {
         twai_driver_uninstall();
+        digitalWrite(kCanSPin, HIGH);
+        gTxEnabled = false;
         Serial.println("[CAN] reinitCan failed");
     }
 }
@@ -326,20 +363,19 @@ class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
 class NusRxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
         const std::string val = pChar->getValue();
-        if (val == "TX_ENABLE") {
-            Serial.println("[CMD] TX_ENABLE received");
-            gReinitTxTarget  = true;
-            gReinitRequested = true;
-        } else if (val == "TX_DISABLE") {
-            Serial.println("[CMD] TX_DISABLE received");
-            gReinitTxTarget  = false;
-            gReinitRequested = true;
+        if (val == "ACK:AUTO" || val == "ACK:OFF" || val == "ACK:ON" ||
+            val == "TX_ENABLE" || val == "TX_DISABLE") {
+            Serial.printf("[CMD] %s received\n", val.c_str());
+            gAckPolicy = (val == "ACK:AUTO") ? AckPolicy::AUTO
+                       : (val == "ACK:ON" || val == "TX_ENABLE") ? AckPolicy::ON
+                       : AckPolicy::OFF;
+            gAckPolicyChanged = true;
         } else if (val.rfind("BAUD:", 0) == 0) {
             const uint32_t baud = static_cast<uint32_t>(atol(val.c_str() + 5));
             if (baud == 125000 || baud == 250000 || baud == 500000 || baud == 1000000) {
                 Serial.printf("[CMD] BAUD:%lu received\n", baud);
                 gReinitBaudRate  = baud;
-                gReinitTxTarget  = gTxEnabled;
+                gReinitTxTarget  = false;   // a new bitrate is proven again before acking
                 gReinitRequested = true;
             } else {
                 Serial.printf("[CMD] BAUD: unsupported rate %lu\n", baud);
@@ -380,6 +416,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         gNotifyMax = notifyMaxFor(connInfo.getMTU());
         gPendingFilterCount = 0;  // every client starts unfiltered
         gFilterRequested    = true;
+        gAckPolicy          = AckPolicy::AUTO;  // and with the default ack policy
+        gAckPolicyChanged   = true;
         ledOn();
         Serial.println("[BLE] Client connected");
     }
@@ -398,12 +436,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             otaAbort();
             Serial.println("[OTA] Aborted — client disconnected");
         }
-        // Return to listen-only on disconnect — safety default
-        if (gTxEnabled) {
-            gReinitTxTarget  = false;
-            gReinitRequested = true;
-            Serial.println("[CAN] Client disconnected — scheduling TX_DISABLE");
-        }
+        // Back to listen on disconnect: nobody is recording, so stay fully passive
+        gAckPolicy = AckPolicy::OFF;
+        gAckPolicyChanged = true;
+        Serial.println("[CAN] Client disconnected — back to listen");
         ledOff();
         Serial.println("[BLE] Client disconnected");
     }
@@ -466,7 +502,7 @@ void initBle() {
 // ── CAN init ──────────────────────────────────────────────────────────────────
 
 bool initCan() {
-    // S pin is already LOW (set in setup), ensuring listen-only on first init
+    // S pin is already HIGH (set in setup): the transceiver is Silent before TWAI starts
     twai_general_config_t gCfg =
         TWAI_GENERAL_CONFIG_DEFAULT(kCanTxPin, kCanRxPin, TWAI_MODE_LISTEN_ONLY);
     gCfg.rx_queue_len = 64;
@@ -496,6 +532,21 @@ bool appendFrame(const twai_message_t& msg) {
     const bool ok = appendLine(line, len);
     if (ok) gStatCanFrames++; else gStatCanDropped++;
     return ok;
+}
+
+// Every received frame, before the filter: the ack proof's frame count, and the repeat
+// count (a frame identical to the one just before, in the same ms, is almost always a
+// resend of an unacknowledged frame).
+void countFrame(const twai_message_t& msg) {
+    gModeFrames++;
+    const uint32_t now = millis();
+    if (now == gPrevMsgMs && msg.identifier == gPrevMsg.identifier && msg.extd == gPrevMsg.extd &&
+        msg.data_length_code == gPrevMsg.data_length_code &&
+        memcmp(msg.data, gPrevMsg.data, msg.data_length_code) == 0) {
+        gStatCanRepeats++;
+    }
+    gPrevMsg = msg;
+    gPrevMsgMs = now;
 }
 
 bool canIdWanted(uint32_t id) {
@@ -629,10 +680,10 @@ void appendImu() {
 // ── Arduino entry points ──────────────────────────────────────────────────────
 
 void setup() {
-    // S pin LOW first — must precede BLE and CAN init so the transceiver
-    // is in listen-only mode before the TWAI driver starts.
+    // S pin HIGH first (transceiver Silent) — must precede BLE and CAN init so the
+    // transceiver can't drive the bus before the TWAI driver starts.
     pinMode(kCanSPin, OUTPUT);
-    digitalWrite(kCanSPin, LOW);
+    digitalWrite(kCanSPin, HIGH);
 
     pinMode(kLedPin, OUTPUT);
     ledOff();
@@ -646,10 +697,47 @@ void setup() {
     if (!gCanReady) {
         Serial.println("[WARN] CAN init failed, BLE still advertising");
     } else {
-        Serial.printf("[OK] CAN @ %lu baud, S=LOW (listen-only), firmware v%s\n",
+        Serial.printf("[OK] CAN @ %lu baud, listen (S=HIGH), firmware v%s\n",
                       kBaud, kFirmwareVersion);
     }
     initImu();
+}
+
+// Applies ack policy commands, switches listen -> ack once the bus is proven (AUTO),
+// and drops back to listen when ack mode sees errors. Called from loop().
+void updateAckMode() {
+    if (gAckPolicyChanged) {
+        gAckPolicyChanged = false;
+        const AckPolicy policy = gAckPolicy;
+        if (policy != AckPolicy::OFF) gAckFellBack = false;  // a connect or a command starts over
+        if (policy == AckPolicy::OFF && gTxEnabled) reinitCan(false);
+        if (policy == AckPolicy::ON && !gTxEnabled) reinitCan(true);
+    }
+    if (!gCanReady || millis() - gLastAckCheckMs < kAckCheckMs) return;
+    gLastAckCheckMs = millis();
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) != ESP_OK) return;
+
+    if (!gTxEnabled) {
+        if (gAckPolicy == AckPolicy::AUTO && !gAckFellBack && gModeFrames >= kAckProofFrames &&
+            st.bus_error_count * kAckProofRatio < gModeFrames) {
+            Serial.printf("[CAN] Bus proven (%lu frames, %lu bus errors) — acknowledging\n",
+                          gModeFrames, st.bus_error_count);
+            reinitCan(true);
+        }
+        return;
+    }
+    const uint32_t frames = gModeFrames - gAckCheckFrames;
+    const uint32_t errors = st.bus_error_count - gAckCheckErrors;
+    gAckCheckFrames = gModeFrames;
+    gAckCheckErrors = st.bus_error_count;
+    if (st.state != TWAI_STATE_RUNNING || st.rx_error_counter >= kAckErrorWarn ||
+        st.tx_error_counter >= kAckErrorWarn || (errors > 5 && errors * kAckProofRatio > frames)) {
+        Serial.printf("[CAN] Ack fallback: state=%d rec=%lu tec=%lu errors=%lu frames=%lu — listening\n",
+                      (int)st.state, st.rx_error_counter, st.tx_error_counter, errors, frames);
+        gAckFellBack = true;
+        reinitCan(false);
+    }
 }
 
 void printStats() {
@@ -663,16 +751,23 @@ void printStats() {
                   (int)gNotifyMax, gFilterCount);
     // Same counters to the phone, so they can be read while the dongle is on a bus
     // and not on USB: STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,
-    // can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes
-    char line[160];
-    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+    // can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes,can_mode,can_repeats,bus_errors
+    twai_status_info_t st = {};
+    const bool haveStatus = gCanReady && twai_get_status_info(&st) == ESP_OK;
+    const uint32_t busErrors = haveStatus ? st.bus_error_count - gStatBusErrorsAt : 0;
+    if (haveStatus) gStatBusErrorsAt = st.bus_error_count;
+    const int canMode = gTxEnabled ? 1 : (gAckFellBack ? 2 : 0);
+    Serial.printf("[STAT] can_mode=%d can_repeats=%lu bus_errors=%lu\n", canMode, gStatCanRepeats, busErrors);
+    char line[192];
+    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%d,%lu,%lu\n",
                              gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets,
                              (int)gImuReady, gStatCanFrames, gStatCanDropped, gStatNotifyFails,
-                             gStatMaxPassMs, gStatNotifies, gStatNotifyBytes);
+                             gStatMaxPassMs, gStatNotifies, gStatNotifyBytes,
+                             canMode, gStatCanRepeats, busErrors);
     if (len > 0 && gClientConnected) appendLine(line, len);
     gStatImuLines = gStatImuDropped = gStatImuEvents = gStatImuResets = 0;
     gStatCanFrames = gStatCanDropped = gStatNotifyFails = gStatMaxPassMs = 0;
-    gStatNotifies = gStatNotifyBytes = 0;
+    gStatNotifies = gStatNotifyBytes = gStatCanRepeats = 0;
 }
 
 void loop() {
@@ -714,18 +809,22 @@ void loop() {
             millis() - gLastBusOffRecoveryMs >= 5000) {
             Serial.println("[CAN] Bus-off — attempting recovery");
             gLastBusOffRecoveryMs = millis();
-            reinitCan(gTxEnabled);
+            gAckFellBack = gAckFellBack || gTxEnabled;  // only ack mode can reach bus-off
+            reinitCan(false);
         }
     }
+    updateAckMode();
 
     if (gCanReady) {
         twai_message_t msg;
         while (twai_receive(&msg, 0) == ESP_OK) {
+            countFrame(msg);
             if (canIdWanted(msg.identifier)) appendFrame(msg);
             if (gTxBufLen > gNotifyMax - kMaxLineLen) flushBuf();
             emitImuIfDue();  // a long CAN burst must not hold the IMU back
         }
         if (twai_receive(&msg, pdMS_TO_TICKS(kFlushIntervalMs)) == ESP_OK) {
+            countFrame(msg);
             if (canIdWanted(msg.identifier)) appendFrame(msg);
         }
     } else {

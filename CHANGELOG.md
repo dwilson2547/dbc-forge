@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-04 (firmware 1.7.0 — acknowledge frames once the bus is proven; S pin polarity)
+
+### Fixed
+- **On a port with no other listener, every frame was recorded several times.** A CAN sender resends a frame until some node acknowledges it, and the dongle only listened. A 2024 Blazer's OBD port acked nothing, so 83% of its recorded frames were back-to-back resends and the extra bus time crowded out the rest; the Impala's port shares a bus with modules that ack. Reproduced with the CAN simulator requiring acks (85% copies). The dongle now acknowledges (TWAI NORMAL) once the bus is proven; on the same bench run that gave 0 copies (69,411 frames, all unique) and 0 bus errors. See robo-services `docs/issues/2026_11_04_can_repeats_on_isolated_obd_port.md`.
+- **The TJA1051 S pin was driven backwards.** NXP's datasheet (Rev. 9, 7.1): S LOW = Normal, S HIGH = Silent (transmitter off). The firmware held S LOW for "listen-only" and set it HIGH for `TX_ENABLE`, so TX mode would have silenced the transceiver and no ACK could reach the bus. Listen mode now holds S HIGH as well as TWAI LISTEN_ONLY (passive at both the controller and the transceiver), and boot starts there.
+
+### Added
+- **Ack policy.** `ACK:AUTO` (default, restored on every connect): listen, and switch to ack after 200 valid frames with fewer than one bus error per 10 of them, so a wrong bitrate never joins the bus. In ack mode, error-warning level, bus-off, or errors above that ratio fall back to listen until the next connect. `ACK:OFF` stays listen-only; `ACK:ON` acks at once. `TX_ENABLE` / `TX_DISABLE` (dbc-forge's toggle) now mean `ACK:ON` / `ACK:OFF`. Disconnect and `BAUD:` return to listen. The firmware still never transmits a frame of its own (`twai_transmit` is not called).
+- **STAT gains `can_mode,can_repeats,bus_errors`.** Mode 0 listen, 1 ack, 2 listen after a fallback; repeats are frames identical to the one just before in the same ms (resends); bus errors in the 5 s window.
+
+### Not yet done
+- `android_app/app/src/main/assets/firmware/firmware.bin` (the OTA bundle) is not rebuilt for 1.7.0. dbc-forge's app parses STAT as before; the new fields are ignored.
+
 ## 2026-11-03 (firmware 1.6.0–1.6.4 — MTU-sized notifications, CAN filter, steady IMU, no lost notifications)
 
 ### Fixed
