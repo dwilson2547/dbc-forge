@@ -83,7 +83,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.7.1";
+constexpr char kFirmwareVersion[] = "1.7.2";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -245,6 +245,8 @@ void otaCommit() {
 }
 
 // A phone reached this image over BLE: keep it (cancels the bootloader's rollback).
+// Works only because verifyRollbackLater() below stops the Arduino core from marking
+// every pending image valid at startup (initArduino, esp32-hal-misc.c).
 void markAppValid() {
     const esp_partition_t* running = esp_ota_get_running_partition();
     esp_ota_img_states_t state;
@@ -700,6 +702,10 @@ void appendImu() {
 } // namespace
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
+
+// Overrides the core's weak default (false), which marks a pending OTA image valid
+// before setup() runs. Returning true leaves that to markAppValid() (1.7.2).
+extern "C" bool verifyRollbackLater() { return true; }
 
 void setup() {
     // S pin HIGH first (transceiver Silent) — must precede BLE and CAN init so the

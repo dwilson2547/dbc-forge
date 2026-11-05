@@ -1,12 +1,17 @@
 # Changelog
 
+## 2026-11-04 (firmware 1.7.2 — rollback protection actually on)
+
+### Fixed
+- **1.7.1's "keep a new image only once a phone reaches it" did nothing.** The Arduino core (3.3.8, `initArduino` in `esp32-hal-misc.c`) marks a pending OTA image valid before `setup()` unless the sketch overrides the weak `verifyRollbackLater()`. Seen on the 1.7.1 update: the dongle reconnected but never logged "New image confirmed by a BLE connection", because the image was no longer pending. The sketch now defines `extern "C" bool verifyRollbackLater() { return true; }` (checked in the ELF: a strong symbol returning 1), so `markAppValid()` on the first BLE connect is what keeps a new image.
+
 ## 2026-11-04 (firmware 1.7.1 — COMMIT acknowledged; keep a new image only once a phone reaches it)
 
 ### Fixed
 - **COMMIT was never acknowledged.** The dongle verified the image and restarted inside the COMMIT write callback, so the write's response never went out and apps reported a failed update that had in fact worked (the old race logger did this). COMMIT now only flags the commit; `loop()` verifies, notifies `VERIFYING` / `OK` (or `ERROR:…`), waits 500 ms for OK to reach the phone, and restarts.
 
 ### Changed
-- **A new image is kept only after a BLE connection.** `esp_ota_mark_app_valid_cancel_rollback()` ran at the top of `setup()`, so an image that booted but couldn't serve BLE was already final, and only USB could fix it. It now runs on the first BLE connect, and only for an image still pending verification. An image no phone can reach stays pending and the bootloader (rollback enabled in the core's bootloader config) returns to the previous one on the next reset; in a car, the next ignition cycle. ⚠ The rollback path itself is not exercised on the bench yet.
+- **A new image is kept only after a BLE connection** (not effective until 1.7.2, see above). `esp_ota_mark_app_valid_cancel_rollback()` ran at the top of `setup()`, so an image that booted but couldn't serve BLE was already final, and only USB could fix it. It now runs on the first BLE connect, and only for an image still pending verification. An image no phone can reach stays pending and the bootloader (rollback enabled in the core's bootloader config) returns to the previous one on the next reset; in a car, the next ignition cycle. ⚠ The rollback path itself is not exercised on the bench yet.
 - Delivered by the robo-services phone gateway's Settings → Dongle → Update (see its README, "Dongle firmware").
 
 ## 2026-11-04 (firmware 1.7.0 — acknowledge frames once the bus is proven; S pin polarity)
