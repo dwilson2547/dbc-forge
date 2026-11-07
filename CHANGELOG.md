@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-07
+
+### Added
+- **`firmware/sd_can_logger/`: the original SD-card CAN logger,** moved here from robo-services (`capture_device_configs/can_capture_dongle_esp32_c6/`) as the dongle's first version, kept for reference. It logs every frame to microSD with a hold-up capacitor for the last write; the BLE bridge replaced it.
+
 ## 2026-11-04 (firmware 1.7.2 — rollback protection actually on)
 
 ### Fixed
