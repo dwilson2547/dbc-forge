@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-17 (firmware 1.8.0 — GPS from a MAX-M10S on the dongle)
+
+### Added
+- **GPS line on the NUS TX stream, 10 Hz.** A u-blox MAX-M10S on UART1 (module TX → D8/GPIO19, RX ← D9/GPIO20, TIMEPULSE → D10/GPIO18) is configured on every boot, RAM layer only: 115200 baud, GPS + Galileo (BeiDou and GLONASS off; the default GPS+GAL+BDS set caps the module at 3 Hz, data sheet UBX-20035208 table 2), 100 ms measurement rate, automotive dynamic model, NMEA off, UBX-NAV-PVT every epoch. Each PVT becomes `GPS,fix,sats,lat_deg,lon_deg,alt_m,speed_mps,heading_deg,hacc_m,utc_ms,pps_ts,ts` (format in the sketch header). PPS edges are timestamped on the dongle's `millis()` clock (`pps_ts`), so a fix can be lined up with CAN and IMU lines. Bench, 2026-11-17: config acknowledged under 1 s after boot, 50 PVT per 5 s, 3D fix, 17 sats, hAcc 0.5–0.8 m, 5 PPS edges per 5 s.
+- The config is redone whenever no PVT has arrived for 3 s (module restarted or plugged in late); after 5 failed tries, every 30 s. It never blocks the loop (the TWAI receive queue holds 64 frames).
+- USB serial `GPSCFG` re-runs the config; the serial stats line gains a `[GPS]` line (PVT count, ACKs, PPS, fix, sats, hAcc, config result).
+
+### Notes (bench findings)
+- This breakout shipped at **38400 baud**, not the data sheet's 9600 (a baud scan found NMEA only at 38400), so the baud change goes out at 38400 and then at 9600.
+- `Serial1.updateBaudRate()` on the C6 left the module acknowledging nothing sent, while reading still worked; the sketch reopens the UART (`end()` + `begin()`) instead.
+- After the copies sent at the wrong baud the module ignores what it receives for 110–400 ms (two bench runs; it acks at once without them). Each config step waits for ACK-ACK and resends every 200 ms, up to 10 times.
+- TIMEPULSE is tied to the module's SAFEBOOT_N through 1 kΩ, so D10 is a plain input and never driven.
+- The robo-services phone gateway does not parse `GPS,` lines yet and counts them as bad lines until it does.
+
 ## 2026-11-07
 
 ### Added

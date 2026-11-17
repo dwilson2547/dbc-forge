@@ -9,6 +9,9 @@
  * - TJA1051 CAN transceiver: TX->D0, RX<-D1, S<-D2
  *   S HIGH = Silent (transmitter off), S LOW = Normal (NXP TJA1051 Rev. 9, 7.1).
  *   Held HIGH on boot; LOW only in ack mode (see "CAN modes").
+ * - u-blox MAX-M10S GPS (1.8.0, optional): module TX->D8 (GPIO19), RX<-D9 (GPIO20),
+ *   TIMEPULSE->D10 (GPIO18, input only). No module: no GPS lines; the config is retried
+ *   (5 tries, then every 30 s) without blocking the loop.
  *
  * BLE services:
  *   NUS (Nordic UART Service) — CAN frame streaming + command channel
@@ -28,6 +31,13 @@
  *     notifies and notify_bytes since 1.6.3; the last three since 1.7.0:
  *     can_mode 0 = listen, 1 = ack, 2 = listen after an ack fallback; can_repeats = frames
  *     identical to the frame just before (id, data, same ms); bus_errors in the window.
+ *   TX notify also carries one GPS line per navigation epoch, 10 Hz (1.8.0+):
+ *     GPS,fix,sats,lat_deg,lon_deg,alt_m,speed_mps,heading_deg,hacc_m,utc_ms,pps_ts,ts
+ *     fix 0 = none (or not gnssFixOK), 2 = 2D, 3 = 3D; alt_m above mean sea level;
+ *     speed_mps ground speed; heading_deg of motion; utc_ms Unix ms, 0 until date and
+ *     time are valid; pps_ts millis() % 65536 at the last PPS edge, -1 before the first;
+ *     ts millis() % 65536 when the line was built (the clock of the other lines).
+ *   USB serial accepts "GPSCFG" (bench): re-run the GPS configuration.
  *
  *   OTA service — firmware update over BLE
  *     Control write:  6E410002-B5A3-F393-E0A9-E50E24DCCA9E
@@ -83,7 +93,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.7.2";
+constexpr char kFirmwareVersion[] = "1.8.0";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -104,6 +114,11 @@ constexpr uint16_t kImuReportMs    = 20;       // 50 Hz — gyro + linear accel
 constexpr uint16_t kImuRvReportMs  = 100;      // 10 Hz — game rotation vector (see note in enableImuReports)
 constexpr uint32_t kImuEmitMs      = 20;       // throttle combined IMU lines to 50 Hz
 constexpr int      kImuDrainMax    = 8;        // max sensor events serviced per loop pass
+
+// u-blox MAX-M10S GPS (1.8.0) on UART1: module TX -> D8, module RX <- D9, PPS -> D10.
+constexpr int kGpsRxPin  = 19;   // D8, ESP RX
+constexpr int kGpsTxPin  = 20;   // D9, ESP TX
+constexpr int kGpsPpsPin = 18;   // D10, input only (see initGps)
 
 // Frame packing
 constexpr uint32_t kFlushIntervalMs = 10;
@@ -699,6 +714,280 @@ void appendImu() {
     if (appendLine(line, len)) gStatImuLines++; else gStatImuDropped++;
 }
 
+// ── GPS (u-blox MAX-M10S, 1.8.0) ──────────────────────────────────────────────
+//
+// The module boots with NMEA output and GPS+Galileo+BeiDou B1I, which caps
+// the navigation rate at 3 Hz (data sheet UBX-20035208 R08, table 2). Its UART rate is
+// 9600 per the data sheet, but the breakout on the bench dongle came at 38400 (measured
+// 2026-11-17, a baud scan: NMEA only at 38400), so the baud change goes out at both. Configured on
+// every boot, RAM layer only (nothing written to the module's flash or battery-backed
+// RAM): 115200 baud, GPS+Galileo (10 Hz max), automotive dynamic model, NMEA off,
+// UBX-NAV-PVT every epoch. Redone whenever no NAV-PVT has arrived for kGpsSilentMs, so a
+// module that restarted on its own (or was plugged in late) comes back.
+
+constexpr uint32_t kGpsBaudBoot  = 9600;    // u-blox default
+constexpr uint32_t kGpsBaudAlt   = 38400;   // as this breakout shipped
+constexpr uint32_t kGpsBaud      = 115200;
+constexpr uint16_t kGpsRateMs    = 100;     // 10 Hz
+constexpr uint32_t kGpsSilentMs  = 3000;
+
+// UBX-CFG-VALSET keys (u-blox M10 SPG 5.10 interface description)
+constexpr uint32_t kKeyUart1Baud    = 0x40520001;  // U4
+constexpr uint32_t kKeyRateMeas     = 0x30210001;  // U2, ms
+constexpr uint32_t kKeyDynModel     = 0x20110021;  // E1, 4 = automotive
+constexpr uint32_t kKeyBdsEna       = 0x10310022;  // L
+constexpr uint32_t kKeyGloEna       = 0x10310025;  // L
+constexpr uint32_t kKeyGalEna       = 0x10310021;  // L
+constexpr uint32_t kKeyGpsEna       = 0x1031001F;  // L
+constexpr uint32_t kKeyUart1Ubx     = 0x10740001;  // L, UBX output on UART1
+constexpr uint32_t kKeyUart1Nmea    = 0x10740002;  // L, NMEA output on UART1
+constexpr uint32_t kKeyPvtUart1     = 0x20910007;  // U1, NAV-PVT per epoch on UART1
+
+uint32_t gGpsLastPvtMs   = 0;
+uint32_t gGpsConfigAtMs  = 0;
+volatile uint32_t gPpsMs = 0;          // millis() at the last PPS rising edge
+volatile bool     gPpsSeen = false;
+uint32_t gStatGpsLines = 0, gStatGpsDropped = 0, gStatGpsBadCk = 0, gStatGpsAcks = 0,
+         gStatGpsNaks = 0, gStatGpsPvts = 0;
+volatile uint32_t gPpsCount = 0;
+uint32_t gStatGpsRxBytes = 0, gStatGpsNmea = 0;   // raw UART bytes; '$' seen (NMEA still on)
+uint8_t  gGpsFix = 0, gGpsSats = 0;     // latest NAV-PVT, for the serial log
+float    gGpsHaccM = 0;
+
+// UBX receive state
+uint8_t  gUbxBuf[100];
+int      gUbxPos = 0;
+uint16_t gUbxLen = 0;
+
+void IRAM_ATTR onPps() {
+    gPpsMs = millis();
+    gPpsSeen = true;
+    gPpsCount++;
+}
+
+void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+    uint8_t hdr[6] = {0xB5, 0x62, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8)};
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 6; i++) { a += hdr[i]; b += a; }
+    for (uint16_t i = 0; i < len; i++) { a += payload[i]; b += a; }
+    Serial1.write(hdr, 6);
+    Serial1.write(payload, len);
+    Serial1.write(a);
+    Serial1.write(b);
+}
+
+// One CFG-VALSET into the RAM layer. Values are written little-endian at their key's size.
+struct KeyVal { uint32_t key; uint32_t val; };
+void gpsValset(const KeyVal* kv, int n) {
+    uint8_t p[4 + 8 * 12];
+    int len = 0;
+    p[len++] = 0x00;   // version
+    p[len++] = 0x01;   // layers: RAM
+    p[len++] = 0; p[len++] = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(p + len, &kv[i].key, 4); len += 4;
+        const int size = (kv[i].key >> 28) & 0x7;    // 1 = bit, 2 = 1 byte, 3 = 2, 4 = 4
+        const int bytes = size == 4 ? 4 : size == 3 ? 2 : 1;
+        memcpy(p + len, &kv[i].val, bytes); len += bytes;
+    }
+    ubxSend(0x06, 0x8A, p, len);
+}
+
+// Non-blocking: the loop can't stall (the TWAI receive queue holds 64 frames, a few tens
+// of ms of a busy bus), so the steps are spaced out by gpsConfigStep() from serviceGps().
+//   step 1: 38400 baud, send the baud change (and UBX output on).
+//   step 2 (+20 ms, once those bytes are out): the same at 9600. A module at another rate
+//           (or still at 115200 from before an ESP reset) sees noise.
+//   step 3 (+60 ms): 115200, constellations. A GNSS signal change restarts the
+//           receiver's tracking.
+//   step 4: rate, dynamic model, NMEA off, NAV-PVT on.
+// Steps 3 and 4 wait for ACK-ACK and resend after kGpsAckWaitMs. After the copies sent at
+// the wrong baud the module ignores what it receives for a while (bench, 2026-11-17:
+// first ACK 110 ms and 400 ms after reopening at 115200 on two runs; at once without
+// the copies), so step 3 usually goes out more than once.
+constexpr uint32_t kGpsAckWaitMs = 200;
+constexpr int      kGpsSendMax   = 10;
+int      gGpsCfgStep   = 0;     // 0 = idle
+uint32_t gGpsCfgStepMs = 0;
+int      gGpsCfgSends  = 0;     // sends of the current step's message
+volatile bool gGpsAcked = false;   // ACK-ACK for a CFG-VALSET since the last send
+uint32_t gGpsCfgTries  = 0;     // since the last NAV-PVT; after 5, retry every 30 s
+char     gGpsCfgResult[24] = "none";   // outcome of the last config, for the serial log
+
+// Reopen UART1 at a new rate. Serial1.updateBaudRate() is not used: after it, the module
+// acknowledged nothing sent (bench, 2026-11-17, Arduino-ESP32 on the C6) although bytes
+// from the module still read correctly; end() + begin() got ACK-ACK.
+void gpsSetBaud(uint32_t baud) {
+    Serial1.end();
+    Serial1.setRxBufferSize(2048);
+    Serial1.begin(baud, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+}
+
+void sendCfgStep(int step) {
+    gGpsAcked = false;
+    gGpsCfgSends++;
+    gGpsCfgStepMs = millis();
+    if (step == 3) {
+        const KeyVal sig[] = {{kKeyGpsEna, 1}, {kKeyGalEna, 1}, {kKeyBdsEna, 0}, {kKeyGloEna, 0}};
+        gpsValset(sig, 4);
+    } else {
+        const KeyVal nav[] = {{kKeyRateMeas, kGpsRateMs}, {kKeyDynModel, 4},
+                              {kKeyUart1Nmea, 0}, {kKeyPvtUart1, 1}};
+        gpsValset(nav, 4);
+    }
+}
+
+void configureGps() {
+    gGpsCfgStep = 1;
+    gGpsCfgStepMs = millis();
+    gGpsConfigAtMs = millis();
+    gGpsCfgTries++;
+    gpsSetBaud(kGpsBaudAlt);
+    const KeyVal baud[] = {{kKeyUart1Baud, kGpsBaud}, {kKeyUart1Ubx, 1}};
+    gpsValset(baud, 2);
+}
+
+void gpsConfigStep() {
+    const uint32_t now = millis();
+    if (gGpsCfgStep == 1) {
+        if (now - gGpsCfgStepMs < 20) return;
+        gpsSetBaud(kGpsBaudBoot);
+        const KeyVal baud[] = {{kKeyUart1Baud, kGpsBaud}, {kKeyUart1Ubx, 1}};
+        gpsValset(baud, 2);
+        gGpsCfgStep = 2;
+        gGpsCfgStepMs = now;
+    } else if (gGpsCfgStep == 2) {
+        if (now - gGpsCfgStepMs < 60) return;
+        gpsSetBaud(kGpsBaud);
+        gGpsCfgStep = 3;
+        gGpsCfgSends = 0;
+        sendCfgStep(3);
+    } else if (gGpsAcked) {
+        if (gGpsCfgStep == 3) {
+            gGpsCfgStep = 4;
+            gGpsCfgSends = 0;
+            sendCfgStep(4);
+        } else {
+            gGpsCfgStep = 0;
+            snprintf(gGpsCfgResult, sizeof(gGpsCfgResult), "ok@%lums", (unsigned long)now);
+            Serial.printf("[GPS] Configured (try %lu): 115200, GPS+GAL, 10 Hz, NAV-PVT\n", gGpsCfgTries);
+        }
+    } else if (now - gGpsCfgStepMs >= kGpsAckWaitMs) {
+        if (gGpsCfgSends < kGpsSendMax) {
+            sendCfgStep(gGpsCfgStep);
+        } else {
+            Serial.printf("[GPS] No ACK at step %d after %d sends (try %lu)\n",
+                          gGpsCfgStep, gGpsCfgSends, gGpsCfgTries);
+            snprintf(gGpsCfgResult, sizeof(gGpsCfgResult), "noack%d@%lums", gGpsCfgStep, (unsigned long)now);
+            gGpsCfgStep = 0;
+        }
+    }
+}
+
+void initGps() {
+    Serial1.setRxBufferSize(2048);
+    Serial1.begin(kGpsBaud, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+    // PPS: plain input, no pull, never driven. TIMEPULSE is tied to SAFEBOOT_N inside
+    // the module (1 kΩ); held low at the module's power-on it boots into safeboot.
+    pinMode(kGpsPpsPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(kGpsPpsPin), onPps, RISING);
+    configureGps();
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+template <typename T> T rd(const uint8_t* p) { T v; memcpy(&v, p, sizeof(T)); return v; }
+
+// GPS line, one per NAV-PVT (same trailing millis%65536 timestamp as the other lines):
+//   GPS,fix,sats,lat,lon,alt_m,speed_mps,heading_deg,hacc_m,utc_ms,pps_ts,<ts>\n
+// fix = NAV-PVT fixType (0 none, 2 2D, 3 3D, ...) or 0 when gnssFixOK is clear.
+// alt_m above mean sea level. utc_ms = Unix ms of the epoch, 0 until date and time are
+// valid. pps_ts = millis()%65536 of the last PPS edge, -1 before the first.
+void handlePvt(const uint8_t* p) {
+    gGpsLastPvtMs = millis();
+    gStatGpsPvts++;
+    gGpsCfgTries = 0;
+    const uint8_t valid = p[11], flags = p[21];
+    const uint8_t fix = (flags & 0x01) ? p[20] : 0;
+    uint64_t utcMs = 0;
+    if ((valid & 0x03) == 0x03) {
+        const int64_t days = daysFromCivil(rd<uint16_t>(p + 4), p[6], p[7]);
+        const int64_t secs = days * 86400 + p[8] * 3600 + p[9] * 60 + p[10];
+        const int64_t ms = secs * 1000 + rd<int32_t>(p + 16) / 1000000;
+        if (ms > 0) utcMs = (uint64_t)ms;
+    }
+    gGpsFix = fix; gGpsSats = p[23]; gGpsHaccM = rd<uint32_t>(p + 40) / 1000.0f;
+    const long ppsTs = gPpsSeen ? (long)(gPpsMs % 65536) : -1;
+    char line[128];
+    const int len = snprintf(line, sizeof(line),
+        "GPS,%u,%u,%.7f,%.7f,%.2f,%.2f,%.1f,%.2f,%llu,%ld,%u\n",
+        fix, p[23], rd<int32_t>(p + 28) * 1e-7, rd<int32_t>(p + 24) * 1e-7,
+        rd<int32_t>(p + 36) / 1000.0, rd<int32_t>(p + 60) / 1000.0,
+        rd<int32_t>(p + 64) * 1e-5, rd<uint32_t>(p + 40) / 1000.0,
+        (unsigned long long)utcMs, ppsTs, (unsigned)(millis() % 65536));
+    if (len <= 0 || !gClientConnected) return;
+    if (appendLine(line, len)) gStatGpsLines++; else gStatGpsDropped++;
+}
+
+void handleUbx(uint8_t cls, uint8_t id, const uint8_t* p, uint16_t len) {
+    if (cls == 0x01 && id == 0x07 && len == 92) handlePvt(p);
+    else if (cls == 0x05 && id == 0x01) {
+        gStatGpsAcks++;
+        if (len >= 2 && p[0] == 0x06 && p[1] == 0x8A) gGpsAcked = true;
+        Serial.printf("[GPS] ACK for 0x%02X 0x%02X\n", len >= 2 ? p[0] : 0, len >= 2 ? p[1] : 0);
+    }
+    else if (cls == 0x05 && id == 0x00) {
+        gStatGpsNaks++;
+        Serial.printf("[GPS] NAK for 0x%02X 0x%02X\n", len >= 2 ? p[0] : 0, len >= 2 ? p[1] : 0);
+    }
+}
+
+// Byte-wise UBX framing: B5 62 cls id lenL lenH payload ckA ckB. Anything else
+// (leftover NMEA, noise at the wrong baud) is skipped.
+void serviceGps() {
+    int budget = 512;
+    while (budget-- > 0 && Serial1.available()) {
+        const uint8_t c = Serial1.read();
+        gStatGpsRxBytes++;
+        if (c == '$') gStatGpsNmea++;
+        if (gUbxPos == 0) { if (c == 0xB5) gUbxBuf[gUbxPos++] = c; continue; }
+        if (gUbxPos == 1) { gUbxPos = c == 0x62 ? 2 : 0; if (gUbxPos) gUbxBuf[1] = c; continue; }
+        if (gUbxPos < 6) {
+            gUbxBuf[gUbxPos++] = c;
+            if (gUbxPos == 6) {
+                gUbxLen = gUbxBuf[4] | (gUbxBuf[5] << 8);
+                if (gUbxLen + 8 > (int)sizeof(gUbxBuf)) gUbxPos = 0;   // not a message we read
+            }
+            continue;
+        }
+        gUbxBuf[gUbxPos++] = c;
+        if (gUbxPos == gUbxLen + 8) {
+            uint8_t a = 0, b = 0;
+            for (int i = 2; i < 6 + gUbxLen; i++) { a += gUbxBuf[i]; b += a; }
+            if (a == gUbxBuf[6 + gUbxLen] && b == gUbxBuf[7 + gUbxLen]) {
+                handleUbx(gUbxBuf[2], gUbxBuf[3], gUbxBuf + 6, gUbxLen);
+            } else {
+                gStatGpsBadCk++;
+            }
+            gUbxPos = 0;
+        }
+    }
+    if (gGpsCfgStep != 0) { gpsConfigStep(); return; }
+    const uint32_t now = millis();
+    const uint32_t retryMs = gGpsCfgTries >= 5 ? 30000 : kGpsSilentMs;
+    if (now - gGpsLastPvtMs >= kGpsSilentMs && now - gGpsConfigAtMs >= retryMs) {
+        configureGps();
+    }
+}
+
 } // namespace
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
@@ -729,6 +1018,7 @@ void setup() {
                       kBaud, kFirmwareVersion);
     }
     initImu();
+    initGps();
 }
 
 // Applies ack policy commands, switches listen -> ack once the bus is proven (AUTO),
@@ -768,6 +1058,22 @@ void updateAckMode() {
     }
 }
 
+// USB serial bench command: "GPSCFG" re-runs the GPS configuration.
+void serviceSerialCommands() {
+    static char cmd[16];
+    static int n = 0;
+    while (Serial.available()) {
+        const char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            cmd[n] = 0;
+            if (strcmp(cmd, "GPSCFG") == 0) configureGps();
+            n = 0;
+        } else if (n < (int)sizeof(cmd) - 1) {
+            cmd[n++] = c;
+        }
+    }
+}
+
 void printStats() {
     const uint32_t now = millis();
     if (now - gLastStatMs < kStatIntervalMs) return;
@@ -786,6 +1092,12 @@ void printStats() {
     if (haveStatus) gStatBusErrorsAt = st.bus_error_count;
     const int canMode = gTxEnabled ? 1 : (gAckFellBack ? 2 : 0);
     Serial.printf("[STAT] can_mode=%d can_repeats=%lu bus_errors=%lu\n", canMode, gStatCanRepeats, busErrors);
+    const uint32_t pps = gPpsCount;
+    gPpsCount = 0;
+    Serial.printf("[GPS] rx_bytes=%lu nmea=%lu baud=%lu pvt=%lu lines=%lu drop=%lu bad_ck=%lu acks=%lu naks=%lu pps=%lu fix=%u sats=%u hacc_m=%.2f cfg=%s\n",
+                  gStatGpsRxBytes, gStatGpsNmea, (unsigned long)Serial1.baudRate(), gStatGpsPvts, gStatGpsLines, gStatGpsDropped, gStatGpsBadCk, gStatGpsAcks,
+                  gStatGpsNaks, pps, gGpsFix, gGpsSats, gGpsHaccM, gGpsCfgResult);
+    gStatGpsRxBytes = gStatGpsNmea = gStatGpsPvts = gStatGpsLines = gStatGpsDropped = gStatGpsBadCk = gStatGpsAcks = gStatGpsNaks = 0;
     char line[192];
     const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%d,%lu,%lu\n",
                              gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets,
@@ -859,6 +1171,7 @@ void loop() {
             if (canIdWanted(msg.identifier)) appendFrame(msg);
             if (gTxBufLen > gNotifyMax - kMaxLineLen) flushBuf();
             emitImuIfDue();  // a long CAN burst must not hold the IMU back
+            serviceGps();
         }
         if (twai_receive(&msg, pdMS_TO_TICKS(kFlushIntervalMs)) == ESP_OK) {
             countFrame(msg);
@@ -876,6 +1189,8 @@ void loop() {
     }
     serviceImu();
     emitImuIfDue();
+    serviceGps();
+    serviceSerialCommands();
 
     if (gTxBufLen > 0 && millis() - gBufFirstLineMs >= kMaxBufferAgeMs) flushBuf();
     const uint32_t pass = millis() - passStart;
