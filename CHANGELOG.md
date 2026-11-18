@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-17 (CANStream carries the dongle's GPS)
+
+### Added
+- **CANStream parses the dongle's `GPS,` lines** (they were counted as unparsed before) and sends the fixes in a new `TelemetryFrame.dongle_gps` section (field 13), next to the phone's own `gps` section rather than in place of it, so consumers can choose by presence and fix quality. Only fixes with fix type 2D or 3D go in; each carries `fix_type`, `num_sats` and the new `hacc_mm` channel (`telemetry.proto` field 23). The fix time comes from the line's `millis()` counter, placed on the phone clock like CAN and IMU.
+- Settings → status shows the dongle receiver's latest fix ("3D, 14 sats, ±0.6 m", or "no fix").
+- The app now bundles firmware 1.8.0 for "Update dongle".
+- kreceiver publishes the dongle section's fixes to `telemetry.raw.gps` when a frame has any, else the phone's, and tags each with `gps_source` (also on the frame receipt), so the existing derivations keep working on the better source.
+
 ## 2026-11-17 (firmware 1.8.0 — GPS from a MAX-M10S on the dongle)
 
 ### Added
@@ -12,7 +20,7 @@
 - `Serial1.updateBaudRate()` on the C6 left the module acknowledging nothing sent, while reading still worked; the sketch reopens the UART (`end()` + `begin()`) instead.
 - After the copies sent at the wrong baud the module ignores what it receives for 110–400 ms (two bench runs; it acks at once without them). Each config step waits for ACK-ACK and resends every 200 ms, up to 10 times.
 - TIMEPULSE is tied to the module's SAFEBOOT_N through 1 kΩ, so D10 is a plain input and never driven.
-- CANStream (the robo-services phone app, formerly the phone gateway) does not parse `GPS,` lines yet and counts them as bad lines until it does.
+- CANStream (the robo-services phone app, formerly the phone gateway) did not parse `GPS,` lines in this release and counted them as bad lines; it parses them from the entry above.
 
 ## 2026-11-07
 
