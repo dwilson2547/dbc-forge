@@ -3,7 +3,7 @@
 ## 2026-11-17 (firmware 1.8.1 — transceiver S pin held LOW)
 
 ### Changed
-- **The S pin (D2) is now held LOW at all times**; listen mode is the TWAI controller's LISTEN_ONLY alone, as it always was on the original unit (S tied to ground). The unmarked "TJA1051" breakouts in use may not behave like a genuine TJA1051 with S HIGH (silent: transmitter off, receiver on). On the GPS bench unit, which has S on D2, no CAN was received while S was HIGH, but the 1.8.1 bench test still saw none, so S is not yet shown to be the cause. The firmware still never calls `twai_transmit`.
+- **The S pin (D2) is now held LOW at all times**; listen mode is the TWAI controller's LISTEN_ONLY alone, as it always was on the original unit (S tied to ground). The unmarked "TJA1051" breakouts in use may not behave like a genuine TJA1051 with S HIGH (silent: transmitter off, receiver on). S was not the cause of the GPS bench unit receiving no CAN: it still received none with S grounded. Its transceiver is suspected faulty (see the robo-services dongle build doc). The firmware still never calls `twai_transmit`.
 
 ## 2026-11-17 (CANStream carries the dongle's GPS)
 
