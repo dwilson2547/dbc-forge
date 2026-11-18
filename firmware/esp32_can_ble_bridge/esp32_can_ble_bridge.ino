@@ -7,8 +7,9 @@
  * - Seeed Studio XIAO ESP32-C6  — D0=GPIO0, D1=GPIO1, D2=GPIO2, LED=GPIO15
  *   FQBN: esp32:esp32:XIAO_ESP32C6
  * - TJA1051 CAN transceiver: TX->D0, RX<-D1, S<-D2
- *   S HIGH = Silent (transmitter off), S LOW = Normal (NXP TJA1051 Rev. 9, 7.1).
- *   Held HIGH on boot; LOW only in ack mode (see "CAN modes").
+ *   S is held LOW (transceiver Normal) at all times, since 1.8.1. Listen mode is the TWAI
+ *   controller's LISTEN_ONLY alone. The unmarked "TJA1051" breakouts in use stop receiving
+ *   with S HIGH (a genuine TJA1051 would only turn its transmitter off).
  * - u-blox MAX-M10S GPS (1.8.0, optional): module TX->D8 (GPIO19), RX<-D9 (GPIO20),
  *   TIMEPULSE->D10 (GPIO18, input only). No module: no GPS lines; the config is retried
  *   (5 tries, then every 30 s) without blocking the loop.
@@ -60,9 +61,9 @@
  * - CAN processing is paused during OTA to avoid BLE congestion.
  *
  * CAN modes (1.7.0):
- * - Listen: TWAI LISTEN_ONLY and the transceiver Silent. Passive twice over. Every boot,
+ * - Listen: TWAI LISTEN_ONLY (the transceiver stays Normal, S LOW, since 1.8.1). Every boot,
  *   every disconnect and every BAUD change starts here.
- * - Ack: TWAI NORMAL and the transceiver Normal. A sender resends a frame until some node
+ * - Ack: TWAI NORMAL. A sender resends a frame until some node
  *   acknowledges it; on a port with no other listener (a 2024 Blazer, 2026-11-04) a
  *   listen-only dongle records every resend. No CAN frames are transmitted by this
  *   firmware (twai_transmit is never called), so ack mode only drives ACK bits and, on
@@ -93,7 +94,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.8.0";
+constexpr char kFirmwareVersion[] = "1.8.1";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -102,7 +103,7 @@ namespace {
 // ── Pin config (XIAO ESP32-C6) ────────────────────────────────────────────────
 constexpr gpio_num_t kCanTxPin = GPIO_NUM_0;  // D0
 constexpr gpio_num_t kCanRxPin = GPIO_NUM_1;  // D1
-constexpr gpio_num_t kCanSPin  = GPIO_NUM_2;  // D2 — TJA1051 S pin (HIGH=Silent, LOW=Normal)
+constexpr gpio_num_t kCanSPin  = GPIO_NUM_2;  // D2 — transceiver S pin, held LOW (see header)
 constexpr uint8_t    kLedPin   = 15;
 constexpr uint32_t   kBaud     = 500000;
 
@@ -284,8 +285,8 @@ void otaAbort() {
     gOtaLastProgress = 0;
 }
 
-// Stop the TWAI driver, set the S pin, and restart in the requested mode/baud.
-// ack = true: TWAI NORMAL, transceiver Normal (S LOW). false: LISTEN_ONLY, Silent (S HIGH).
+// Stop the TWAI driver and restart in the requested mode/baud.
+// ack = true: TWAI NORMAL. false: LISTEN_ONLY. The S pin stays LOW either way.
 // Must only be called from loop() — not from BLE callback context.
 void reinitCan(bool enableTx) {
     if (gCanReady) {
@@ -294,10 +295,6 @@ void reinitCan(bool enableTx) {
         gCanReady = false;
     }
 
-    // Going to listen: the controller is already stopped, so silencing the transceiver
-    // first is safe. Going to ack: the controller starts in NORMAL only after S is LOW.
-    digitalWrite(kCanSPin, enableTx ? LOW : HIGH);
-    delay(5); // let the transceiver settle after S-pin change
 
     twai_general_config_t gCfg = TWAI_GENERAL_CONFIG_DEFAULT(
         kCanTxPin, kCanRxPin,
@@ -319,10 +316,9 @@ void reinitCan(bool enableTx) {
         gTxEnabled = enableTx;
         gModeFrames = gAckCheckFrames = gAckCheckErrors = gStatBusErrorsAt = 0;
         Serial.printf("[CAN] Mode: %s  Baud: %lu\n",
-                      enableTx ? "ACK (NORMAL, S=LOW)" : "LISTEN (LISTEN_ONLY, S=HIGH)", gReinitBaudRate);
+                      enableTx ? "ACK (NORMAL)" : "LISTEN (LISTEN_ONLY)", gReinitBaudRate);
     } else {
         twai_driver_uninstall();
-        digitalWrite(kCanSPin, HIGH);
         gTxEnabled = false;
         Serial.println("[CAN] reinitCan failed");
     }
@@ -541,7 +537,7 @@ void initBle() {
 // ── CAN init ──────────────────────────────────────────────────────────────────
 
 bool initCan() {
-    // S pin is already HIGH (set in setup): the transceiver is Silent before TWAI starts
+    // Starts LISTEN_ONLY: the controller never drives TX, so the transceiver stays recessive
     twai_general_config_t gCfg =
         TWAI_GENERAL_CONFIG_DEFAULT(kCanTxPin, kCanRxPin, TWAI_MODE_LISTEN_ONLY);
     gCfg.rx_queue_len = 64;
@@ -997,10 +993,9 @@ void serviceGps() {
 extern "C" bool verifyRollbackLater() { return true; }
 
 void setup() {
-    // S pin HIGH first (transceiver Silent) — must precede BLE and CAN init so the
-    // transceiver can't drive the bus before the TWAI driver starts.
+    // S LOW: transceiver Normal. TXD idles recessive until TWAI starts in LISTEN_ONLY.
     pinMode(kCanSPin, OUTPUT);
-    digitalWrite(kCanSPin, HIGH);
+    digitalWrite(kCanSPin, LOW);
 
     pinMode(kLedPin, OUTPUT);
     ledOff();
@@ -1014,7 +1009,7 @@ void setup() {
     if (!gCanReady) {
         Serial.println("[WARN] CAN init failed, BLE still advertising");
     } else {
-        Serial.printf("[OK] CAN @ %lu baud, listen (S=HIGH), firmware v%s\n",
+        Serial.printf("[OK] CAN @ %lu baud, listen, firmware v%s\n",
                       kBaud, kFirmwareVersion);
     }
     initImu();
