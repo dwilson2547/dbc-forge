@@ -12,7 +12,7 @@
 - `Serial1.updateBaudRate()` on the C6 left the module acknowledging nothing sent, while reading still worked; the sketch reopens the UART (`end()` + `begin()`) instead.
 - After the copies sent at the wrong baud the module ignores what it receives for 110–400 ms (two bench runs; it acks at once without them). Each config step waits for ACK-ACK and resends every 200 ms, up to 10 times.
 - TIMEPULSE is tied to the module's SAFEBOOT_N through 1 kΩ, so D10 is a plain input and never driven.
-- The robo-services phone gateway does not parse `GPS,` lines yet and counts them as bad lines until it does.
+- CANStream (the robo-services phone app, formerly the phone gateway) does not parse `GPS,` lines yet and counts them as bad lines until it does.
 
 ## 2026-11-07
 
