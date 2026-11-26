@@ -20,7 +20,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"     # robo-services (shared bin/)
 CAN_DONGLE_FIRMWARE="${CAN_DONGLE_FIRMWARE:-$PROJECT_ROOT/../can-dongle-firmware}"
 FIRMWARE_SRC="$CAN_DONGLE_FIRMWARE/esp32_can_ble_bridge"
 [[ -d "$FIRMWARE_SRC" ]] || { echo "ERROR: $FIRMWARE_SRC not found; init the can-dongle-firmware submodule or set CAN_DONGLE_FIRMWARE" >&2; exit 1; }
-ARDUINO_CLI="${ARDUINO_CLI:-$(command -v arduino-cli || echo "$HOME/.local/bin/arduino-cli")}"
+ARDUINO_CLI="${ARDUINO_CLI:-arduino-cli}"
+command -v "$ARDUINO_CLI" >/dev/null || { echo "arduino-cli not on PATH (or set ARDUINO_CLI)" >&2; exit 1; }
 ASSETS_DIR="$PROJECT_ROOT/android_app/app/src/main/assets/firmware"
 BUILD_DIR="/tmp/can_ble_ota_build"
 FQBN="esp32:esp32:XIAO_ESP32C6"
