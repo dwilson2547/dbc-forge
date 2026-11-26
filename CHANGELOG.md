@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-26 (firmware 1.8.2 — race and parser fixes, controller loss counters)
+
+Found in a read-through of `esp32_can_ble_bridge.ino`. Compiles for the XIAO C6; **not flashed or run on a bus yet**, and not rebundled in an app.
+
+### Fixed
+- **Connect no longer empties the TX buffer from the BLE task.** `onConnect` set `gTxBufLen = 0` while `loop()` could be inside `appendLine()`, which could leave the first notification after a connect with a cut-short line. It now sets a flag and `loop()` clears the buffer (the hand-off the firmware already uses for FILTER and CAN reinit). `gClientConnected` and `gOtaPhase`, written by the BLE task and read by `loop()`, are `volatile`.
+- **A disconnect, ABORT or START can no longer abort an OTA commit in flight.** Between `esp_ota_end()` and `esp_ota_set_boot_partition()` a disconnect nulled `gOtaPartition`, so a fully written image failed to activate. `otaAbort()` now does nothing while the phase is COMMITTING, and START answers `ERROR:committing` instead of starting a second update.
+- **UBX framing resyncs on `B5 B5 62`.** A stray `0xB5` before a real start dropped that message; now the second `B5` is taken as the start.
+- Header comment said ESP32-S3; the target has been the C6 only since S3 support was removed.
+
+### Added
+- **`rx_missed` and `rx_overrun` in the STAT line** (two trailing fields, per 5 s window) and in the USB `[STAT]` line: frames the TWAI controller lost, from `twai_status_info_t`. `can_drop` only counts lines the BLE buffer refused, so loss in the controller's 64-frame RX queue was invisible. CANStream's parser ignores fields past the 14th, so older apps are unaffected; it does not read these yet.
+
 ## 2026-11-17 (firmware 1.8.1 — transceiver S pin held LOW)
 
 ### Changed

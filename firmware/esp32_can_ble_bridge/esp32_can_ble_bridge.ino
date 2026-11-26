@@ -1,7 +1,7 @@
 /*
  * esp32_can_ble_bridge.ino
  * ------------------------
- * ESP32-S3 CAN listener that bridges decoded CAN frames over BLE NUS UART.
+ * ESP32-C6 CAN listener that bridges decoded CAN frames over BLE NUS UART.
  *
  * Hardware target:
  * - Seeed Studio XIAO ESP32-C6  — D0=GPIO0, D1=GPIO1, D2=GPIO2, LED=GPIO15
@@ -28,8 +28,10 @@
  *                 "FILTER:" forwards every id again. Reset on every connect.
  *   TX notify also carries a diagnostics line every 5 s (1.6.2+):
  *     STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,can,can_drop,notify_fail,max_pass_ms,
- *          notifies,notify_bytes,can_mode,can_repeats,bus_errors
- *     notifies and notify_bytes since 1.6.3; the last three since 1.7.0:
+ *          notifies,notify_bytes,can_mode,can_repeats,bus_errors,rx_missed,rx_overrun
+ *     notifies and notify_bytes since 1.6.3; can_mode, can_repeats, bus_errors since 1.7.0;
+ *     rx_missed and rx_overrun since 1.8.2 (frames the controller lost in the window, from
+ *     twai_status_info_t: invisible in can_drop, which only counts lines the BLE buffer refused):
  *     can_mode 0 = listen, 1 = ack, 2 = listen after an ack fallback; can_repeats = frames
  *     identical to the frame just before (id, data, same ms); bus_errors in the window.
  *   TX notify also carries one GPS line per navigation epoch, 10 Hz (1.8.0+):
@@ -94,7 +96,7 @@
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 
-constexpr char kFirmwareVersion[] = "1.8.1";
+constexpr char kFirmwareVersion[] = "1.8.2";
 
 // ── Hardware config ───────────────────────────────────────────────────────────
 
@@ -142,7 +144,7 @@ NimBLECharacteristic* gTxCharacteristic = nullptr;   // NUS TX (frames → phone
 NimBLECharacteristic* gOtaStatusChar    = nullptr;
 NimBLEAdvertising*    gAdvertising      = nullptr;
 
-bool     gClientConnected = false;
+volatile bool gClientConnected = false;   // set by the BLE task, read by loop()
 bool     gCanReady        = false;
 bool     gTxEnabled       = false;    // current mode: true = ack (NORMAL), false = listen
 
@@ -175,6 +177,9 @@ bool     gImuHasData = false;          // at least one report cached since boot
 // Frame pack buffer (NUS TX)
 char gTxBuf[kBufSize];
 int  gTxBufLen = 0;
+// Set by onConnect (BLE task); loop() empties the buffer. Resetting gTxBufLen from the callback
+// could land inside appendLine() and leave a line cut short.
+volatile bool gResetTxBuf = false;
 
 // Deferred CAN reinit — set by BLE callback, applied in loop() at a safe point
 volatile bool     gReinitRequested = false;
@@ -199,6 +204,7 @@ uint32_t gStatImuLines = 0, gStatImuDropped = 0, gStatImuEvents = 0, gStatImuRes
 uint32_t gStatCanFrames = 0, gStatCanDropped = 0, gStatNotifyFails = 0, gStatMaxPassMs = 0;
 uint32_t gStatNotifies = 0, gStatNotifyBytes = 0;
 uint32_t gStatCanRepeats = 0, gStatBusErrorsAt = 0;   // repeats in the window; bus errors at its start
+uint32_t gStatRxMissedAt = 0, gStatRxOverrunAt = 0;   // controller loss counters at the window's start
 twai_message_t gPrevMsg = {};   // the frame received just before, for the repeat count
 uint32_t       gPrevMsgMs = 0;
 uint32_t gLastStatMs = 0;
@@ -218,7 +224,7 @@ uint32_t gLastBusOffRecoveryMs = 0;
 
 enum class OtaPhase { IDLE, RECEIVING, COMMITTING };
 
-OtaPhase               gOtaPhase         = OtaPhase::IDLE;
+volatile OtaPhase      gOtaPhase         = OtaPhase::IDLE;   // changed by BLE callbacks and loop()
 esp_ota_handle_t       gOtaHandle        = 0;
 const esp_partition_t* gOtaPartition     = nullptr;
 size_t                 gOtaExpectedBytes = 0;
@@ -274,6 +280,9 @@ void markAppValid() {
 }
 
 void otaAbort() {
+    // A commit is verified and applied from loop(); a disconnect, ABORT or START meanwhile
+    // would null gOtaPartition between esp_ota_end() and esp_ota_set_boot_partition().
+    if (gOtaPhase == OtaPhase::COMMITTING) return;
     if (gOtaPhase == OtaPhase::RECEIVING) {
         esp_ota_abort(gOtaHandle);
         gOtaHandle = 0;
@@ -315,6 +324,7 @@ void reinitCan(bool enableTx) {
         gCanReady  = true;
         gTxEnabled = enableTx;
         gModeFrames = gAckCheckFrames = gAckCheckErrors = gStatBusErrorsAt = 0;
+        gStatRxMissedAt = gStatRxOverrunAt = 0;   // the driver's counters restart with it
         Serial.printf("[CAN] Mode: %s  Baud: %lu\n",
                       enableTx ? "ACK (NORMAL)" : "LISTEN (LISTEN_ONLY)", gReinitBaudRate);
     } else {
@@ -333,6 +343,7 @@ class OtaCtrlCallbacks : public NimBLECharacteristicCallbacks {
 
         if (val.rfind("START:", 0) == 0) {
             if (gOtaPhase != OtaPhase::IDLE) otaAbort();
+            if (gOtaPhase != OtaPhase::IDLE) { otaNotify("ERROR:committing"); return; }
             const size_t size = static_cast<size_t>(atol(val.c_str() + 6));
             if (size == 0) { otaNotify("ERROR:invalid_size"); return; }
 
@@ -446,7 +457,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
         (void)server;
         gClientConnected = true;
-        gTxBufLen = 0;
+        gResetTxBuf = true;
         gNotifyMax = notifyMaxFor(connInfo.getMTU());
         gPendingFilterCount = 0;  // every client starts unfiltered
         gFilterRequested    = true;
@@ -955,7 +966,11 @@ void serviceGps() {
         gStatGpsRxBytes++;
         if (c == '$') gStatGpsNmea++;
         if (gUbxPos == 0) { if (c == 0xB5) gUbxBuf[gUbxPos++] = c; continue; }
-        if (gUbxPos == 1) { gUbxPos = c == 0x62 ? 2 : 0; if (gUbxPos) gUbxBuf[1] = c; continue; }
+        if (gUbxPos == 1) {
+            if (c == 0x62) { gUbxBuf[1] = c; gUbxPos = 2; }
+            else if (c != 0xB5) gUbxPos = 0;   // B5 B5 62: the second B5 is the real start
+            continue;
+        }
         if (gUbxPos < 6) {
             gUbxBuf[gUbxPos++] = c;
             if (gUbxPos == 6) {
@@ -1080,13 +1095,18 @@ void printStats() {
                   (int)gNotifyMax, gFilterCount);
     // Same counters to the phone, so they can be read while the dongle is on a bus
     // and not on USB: STAT,imu_lines,imu_drop,imu_events,imu_resets,imu_ready,
-    // can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes,can_mode,can_repeats,bus_errors
+    // can,can_drop,notify_fail,max_pass_ms,notifies,notify_bytes,can_mode,can_repeats,bus_errors,
+    // rx_missed,rx_overrun
     twai_status_info_t st = {};
     const bool haveStatus = gCanReady && twai_get_status_info(&st) == ESP_OK;
     const uint32_t busErrors = haveStatus ? st.bus_error_count - gStatBusErrorsAt : 0;
     if (haveStatus) gStatBusErrorsAt = st.bus_error_count;
+    const uint32_t rxMissed  = haveStatus ? st.rx_missed_count  - gStatRxMissedAt  : 0;
+    const uint32_t rxOverrun = haveStatus ? st.rx_overrun_count - gStatRxOverrunAt : 0;
+    if (haveStatus) { gStatRxMissedAt = st.rx_missed_count; gStatRxOverrunAt = st.rx_overrun_count; }
     const int canMode = gTxEnabled ? 1 : (gAckFellBack ? 2 : 0);
-    Serial.printf("[STAT] can_mode=%d can_repeats=%lu bus_errors=%lu\n", canMode, gStatCanRepeats, busErrors);
+    Serial.printf("[STAT] can_mode=%d can_repeats=%lu bus_errors=%lu rx_missed=%lu rx_overrun=%lu\n",
+                  canMode, gStatCanRepeats, busErrors, rxMissed, rxOverrun);
     const uint32_t pps = gPpsCount;
     gPpsCount = 0;
     Serial.printf("[GPS] rx_bytes=%lu nmea=%lu baud=%lu pvt=%lu lines=%lu drop=%lu bad_ck=%lu acks=%lu naks=%lu pps=%lu fix=%u sats=%u hacc_m=%.2f cfg=%s\n",
@@ -1094,11 +1114,11 @@ void printStats() {
                   gStatGpsNaks, pps, gGpsFix, gGpsSats, gGpsHaccM, gGpsCfgResult);
     gStatGpsRxBytes = gStatGpsNmea = gStatGpsPvts = gStatGpsLines = gStatGpsDropped = gStatGpsBadCk = gStatGpsAcks = gStatGpsNaks = 0;
     char line[192];
-    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%d,%lu,%lu\n",
+    const int len = snprintf(line, sizeof(line), "STAT,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu\n",
                              gStatImuLines, gStatImuDropped, gStatImuEvents, gStatImuResets,
                              (int)gImuReady, gStatCanFrames, gStatCanDropped, gStatNotifyFails,
                              gStatMaxPassMs, gStatNotifies, gStatNotifyBytes,
-                             canMode, gStatCanRepeats, busErrors);
+                             canMode, gStatCanRepeats, busErrors, rxMissed, rxOverrun);
     if (len > 0 && gClientConnected) appendLine(line, len);
     gStatImuLines = gStatImuDropped = gStatImuEvents = gStatImuResets = 0;
     gStatCanFrames = gStatCanDropped = gStatNotifyFails = gStatMaxPassMs = 0;
@@ -1107,6 +1127,7 @@ void printStats() {
 
 void loop() {
     const uint32_t passStart = millis();
+    if (gResetTxBuf) { gResetTxBuf = false; gTxBufLen = 0; }
     // Apply a FILTER command (or the reset on connect). Clear the flag before copying:
     // a command arriving mid-copy sets it again and is applied on the next pass.
     if (gFilterRequested) {
