@@ -2,7 +2,7 @@
 
 This sub-project now includes:
 
-- `firmware/esp32_can_ble_bridge/esp32_can_ble_bridge.ino`  
+- The dongle firmware moved to its own repo, `embedded/can-dongle-firmware` (`esp32_can_ble_bridge/esp32_can_ble_bridge.ino`; releases and history there).  
   ESP32-C6 firmware that listens to CAN in TWAI listen-only mode and publishes frames over BLE (Nordic UART profile).
 - `android_app/`  
   Android Kotlin app that scans for the dongle, connects over BLE, subscribes to notifications, and displays incoming CAN frame lines.
@@ -51,11 +51,11 @@ chmod +x scripts/build_and_stage_firmware.sh
 ./scripts/build_and_stage_firmware.sh --flash  # compile, stage, and USB flash
 ```
 
-Or flash directly with arduino-cli (run from `firmware/esp32_can_ble_bridge/`):
+The script reads the sketch from `../can-dongle-firmware` (override with `CAN_DONGLE_FIRMWARE`). Or flash directly with arduino-cli (run from `embedded/can-dongle-firmware/esp32_can_ble_bridge/`):
 
 ```bash
-../../../bin/arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 . && \
-../../../bin/arduino-cli upload --fqbn esp32:esp32:XIAO_ESP32C6 --port /dev/ttyACM0 .
+arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 . && \
+arduino-cli upload --fqbn esp32:esp32:XIAO_ESP32C6 --port /dev/ttyACM0 .
 ```
 
 Board target: **Seeed Studio XIAO ESP32-C6**

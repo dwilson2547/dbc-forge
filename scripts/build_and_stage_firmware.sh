@@ -15,8 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"     # this project (dbc-forge), rename-proof
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"     # robo-services (shared bin/)
 
-ARDUINO_CLI="$REPO_ROOT/bin/arduino-cli"
-FIRMWARE_SRC="$PROJECT_ROOT/firmware/esp32_can_ble_bridge"
+# The dongle firmware lives in its own repo (can-dongle-firmware), a sibling of this one in
+# the workspace superrepo. Override with CAN_DONGLE_FIRMWARE=/path/to/can-dongle-firmware.
+CAN_DONGLE_FIRMWARE="${CAN_DONGLE_FIRMWARE:-$PROJECT_ROOT/../can-dongle-firmware}"
+FIRMWARE_SRC="$CAN_DONGLE_FIRMWARE/esp32_can_ble_bridge"
+[[ -d "$FIRMWARE_SRC" ]] || { echo "ERROR: $FIRMWARE_SRC not found; init the can-dongle-firmware submodule or set CAN_DONGLE_FIRMWARE" >&2; exit 1; }
+ARDUINO_CLI="${ARDUINO_CLI:-$(command -v arduino-cli || echo "$HOME/.local/bin/arduino-cli")}"
 ASSETS_DIR="$PROJECT_ROOT/android_app/app/src/main/assets/firmware"
 BUILD_DIR="/tmp/can_ble_ota_build"
 FQBN="esp32:esp32:XIAO_ESP32C6"

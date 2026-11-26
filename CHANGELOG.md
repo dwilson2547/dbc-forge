@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-26 (dongle firmware moved out)
+
+`firmware/esp32_can_ble_bridge/` now lives in its own private repo, `embedded/can-dongle-firmware` (CI builds it on PRs, publishes OTA/merged images as GitHub releases on merge to main; history was split out, tags v1.5.0…v1.8.1 sit on the original commits). Firmware changes and their changelog entries are made there from 1.8.2 on; the 1.8.2 entry below stays as the record of when it was written. `scripts/build_and_stage_firmware.sh` reads the sketch from the sibling repo (`CAN_DONGLE_FIRMWARE` overrides) and finds `arduino-cli` on PATH. `firmware/sd_can_logger/` stays here.
+
 ## 2026-11-26 (firmware 1.8.2 — race and parser fixes, controller loss counters)
 
 Found in a read-through of `esp32_can_ble_bridge.ino`. Compiles for the XIAO C6; **not flashed or run on a bus yet**, and not rebundled in an app.
